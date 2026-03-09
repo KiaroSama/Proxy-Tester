@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import contextlib
 import importlib
 import ipaddress
 import json
@@ -100,61 +99,6 @@ class Ansi:
 USE_COLOR = sys.stderr.isatty() and not os.environ.get("NO_COLOR")
 
 
-def cleanup_closed_enabled() -> bool:
-    return sys.platform != "win32"
-
-
-def should_ignore_loop_exception(context: Dict[str, object]) -> bool:
-    if sys.platform != "win32":
-        return False
-
-    exc = context.get("exception")
-    if not isinstance(exc, ConnectionResetError):
-        return False
-    if getattr(exc, "winerror", None) != 10054:
-        return False
-
-    message = str(context.get("message") or "")
-    if "_ProactorBasePipeTransport._call_connection_lost" in message:
-        return True
-
-    handle = context.get("handle")
-    callback = getattr(handle, "_callback", None)
-    callback_name = getattr(callback, "__qualname__", "") or repr(callback)
-    return "_ProactorBasePipeTransport._call_connection_lost" in callback_name
-
-
-def configure_asyncio_loop(loop: asyncio.AbstractEventLoop) -> None:
-    def handler(loop: asyncio.AbstractEventLoop, context: Dict[str, object]) -> None:
-        if should_ignore_loop_exception(context):
-            return
-        loop.default_exception_handler(context)
-
-    loop.set_exception_handler(handler)
-
-
-def run_async_entry(coro: asyncio.Future) -> int:
-    loop = asyncio.new_event_loop()
-    try:
-        asyncio.set_event_loop(loop)
-        configure_asyncio_loop(loop)
-        return loop.run_until_complete(coro)
-    finally:
-        with contextlib.suppress(Exception):
-            pending = [task for task in asyncio.all_tasks(loop) if not task.done()]
-            for task in pending:
-                task.cancel()
-            if pending:
-                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
-        with contextlib.suppress(Exception):
-            loop.run_until_complete(loop.shutdown_asyncgens())
-        with contextlib.suppress(Exception):
-            loop.run_until_complete(loop.shutdown_default_executor())
-        asyncio.set_event_loop(None)
-        with contextlib.suppress(Exception):
-            loop.close()
-
-
 def paint(text: str, code: str) -> str:
     if not USE_COLOR:
         return text
@@ -166,14 +110,34 @@ SOURCES: Tuple[SourceSpec, ...] = (
         name="proxifly_http",
         urls=(
             "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/http/data.txt",
+            "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/http/data.txt",
         ),
         scheme_hint="http",
         max_items=6000,
     ),
     SourceSpec(
+        name="proxifly_https",
+        urls=(
+            "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/https/data.txt",
+            "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/https/data.txt",
+        ),
+        scheme_hint="http",
+        max_items=5000,
+    ),
+    SourceSpec(
+        name="proxifly_all",
+        urls=(
+            "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/all/data.txt",
+            "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/all/data.txt",
+        ),
+        scheme_hint=None,
+        max_items=9000,
+    ),
+    SourceSpec(
         name="proxifly_socks4",
         urls=(
             "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/socks4/data.txt",
+            "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/socks4/data.txt",
         ),
         scheme_hint="socks4",
         max_items=5000,
@@ -182,6 +146,7 @@ SOURCES: Tuple[SourceSpec, ...] = (
         name="proxifly_socks5",
         urls=(
             "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/socks5/data.txt",
+            "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/socks5/data.txt",
         ),
         scheme_hint="socks5",
         max_items=5000,
@@ -230,6 +195,46 @@ SOURCES: Tuple[SourceSpec, ...] = (
         name="roosterkid_socks5",
         urls=(
             "https://raw.githubusercontent.com/roosterkid/openproxylist/main/SOCKS5_RAW.txt",
+        ),
+        scheme_hint="socks5",
+        max_items=5000,
+    ),
+    SourceSpec(
+        name="iplocate_all",
+        urls=(
+            "https://raw.githubusercontent.com/iplocate/free-proxy-list/main/all-proxies.txt",
+        ),
+        scheme_hint=None,
+        max_items=9000,
+    ),
+    SourceSpec(
+        name="iplocate_http",
+        urls=(
+            "https://raw.githubusercontent.com/iplocate/free-proxy-list/main/protocols/http.txt",
+        ),
+        scheme_hint="http",
+        max_items=6000,
+    ),
+    SourceSpec(
+        name="iplocate_https",
+        urls=(
+            "https://raw.githubusercontent.com/iplocate/free-proxy-list/main/protocols/https.txt",
+        ),
+        scheme_hint="http",
+        max_items=5000,
+    ),
+    SourceSpec(
+        name="iplocate_socks4",
+        urls=(
+            "https://raw.githubusercontent.com/iplocate/free-proxy-list/main/protocols/socks4.txt",
+        ),
+        scheme_hint="socks4",
+        max_items=5000,
+    ),
+    SourceSpec(
+        name="iplocate_socks5",
+        urls=(
+            "https://raw.githubusercontent.com/iplocate/free-proxy-list/main/protocols/socks5.txt",
         ),
         scheme_hint="socks5",
         max_items=5000,
@@ -361,6 +366,14 @@ SOURCES: Tuple[SourceSpec, ...] = (
         max_items=5000,
     ),
     SourceSpec(
+        name="dpangestuw_all",
+        urls=(
+            "https://raw.githubusercontent.com/dpangestuw/Free-Proxy/refs/heads/main/allive.txt",
+        ),
+        scheme_hint=None,
+        max_items=9000,
+    ),
+    SourceSpec(
         name="joy_http",
         urls=(
             "https://raw.githubusercontent.com/thenasty1337/free-proxy-list/main/data/latest/types/http/proxies.txt",
@@ -385,12 +398,60 @@ SOURCES: Tuple[SourceSpec, ...] = (
         max_items=5000,
     ),
     SourceSpec(
+        name="joy_all",
+        urls=(
+            "https://raw.githubusercontent.com/thenasty1337/free-proxy-list/main/data/latest/proxies.txt",
+        ),
+        scheme_hint=None,
+        max_items=9000,
+    ),
+    SourceSpec(
         name="kangproxy_raw",
         urls=(
             "https://raw.githubusercontent.com/officialputuid/KangProxy/KangProxy/xResults/RAW.txt",
         ),
         scheme_hint=None,
         max_items=7000,
+    ),
+    SourceSpec(
+        name="kangproxy_http",
+        urls=(
+            "https://raw.githubusercontent.com/officialputuid/KangProxy/KangProxy/http/http.txt",
+        ),
+        scheme_hint="http",
+        max_items=6000,
+    ),
+    SourceSpec(
+        name="kangproxy_https",
+        urls=(
+            "https://raw.githubusercontent.com/officialputuid/KangProxy/KangProxy/https/https.txt",
+        ),
+        scheme_hint="http",
+        max_items=5000,
+    ),
+    SourceSpec(
+        name="kangproxy_socks4",
+        urls=(
+            "https://raw.githubusercontent.com/officialputuid/KangProxy/KangProxy/socks4/socks4.txt",
+        ),
+        scheme_hint="socks4",
+        max_items=5000,
+    ),
+    SourceSpec(
+        name="kangproxy_socks5",
+        urls=(
+            "https://raw.githubusercontent.com/officialputuid/KangProxy/KangProxy/socks5/socks5.txt",
+        ),
+        scheme_hint="socks5",
+        max_items=5000,
+    ),
+    SourceSpec(
+        name="kangproxy_all",
+        urls=(
+            "https://raw.githubusercontent.com/officialputuid/KangProxy/KangProxy/xResults/Proxies.txt",
+        ),
+        scheme_hint=None,
+        max_items=9000,
     ),
     SourceSpec(
         name="gfp_http",
@@ -425,12 +486,68 @@ SOURCES: Tuple[SourceSpec, ...] = (
         max_items=4000,
     ),
     SourceSpec(
+        name="aliilapro_http",
+        urls=(
+            "https://raw.githubusercontent.com/ALIILAPRO/Proxy/main/http.txt",
+        ),
+        scheme_hint="http",
+        max_items=5000,
+    ),
+    SourceSpec(
+        name="aliilapro_socks4",
+        urls=(
+            "https://raw.githubusercontent.com/ALIILAPRO/Proxy/main/socks4.txt",
+        ),
+        scheme_hint="socks4",
+        max_items=5000,
+    ),
+    SourceSpec(
+        name="aliilapro_socks5",
+        urls=(
+            "https://raw.githubusercontent.com/ALIILAPRO/Proxy/main/socks5.txt",
+        ),
+        scheme_hint="socks5",
+        max_items=5000,
+    ),
+    SourceSpec(
         name="themiralay_http",
         urls=(
             "https://raw.githubusercontent.com/themiralay/Proxy-List-World/master/data.txt",
         ),
         scheme_hint="http",
         max_items=1000,
+    ),
+    SourceSpec(
+        name="firmfox_http",
+        urls=(
+            "https://raw.githubusercontent.com/Firmfox/proxify/main/proxies/http.txt",
+        ),
+        scheme_hint="http",
+        max_items=5000,
+    ),
+    SourceSpec(
+        name="firmfox_https",
+        urls=(
+            "https://raw.githubusercontent.com/Firmfox/proxify/main/proxies/https.txt",
+        ),
+        scheme_hint="http",
+        max_items=5000,
+    ),
+    SourceSpec(
+        name="firmfox_socks4",
+        urls=(
+            "https://raw.githubusercontent.com/Firmfox/proxify/main/proxies/socks4.txt",
+        ),
+        scheme_hint="socks4",
+        max_items=5000,
+    ),
+    SourceSpec(
+        name="firmfox_socks5",
+        urls=(
+            "https://raw.githubusercontent.com/Firmfox/proxify/main/proxies/socks5.txt",
+        ),
+        scheme_hint="socks5",
+        max_items=5000,
     ),
     SourceSpec(
         name="mishakorzik_http",
@@ -440,6 +557,14 @@ SOURCES: Tuple[SourceSpec, ...] = (
         ),
         scheme_hint="http",
         max_items=4000,
+    ),
+    SourceSpec(
+        name="loneking_all",
+        urls=(
+            "https://raw.githubusercontent.com/LoneKingCode/free-proxy-db/refs/heads/main/proxies/all.txt",
+        ),
+        scheme_hint=None,
+        max_items=9000,
     ),
 )
 
@@ -705,7 +830,7 @@ async def fetch_all_sources(args) -> Tuple[List[ProxyCandidate], List[SourceResu
     aiohttp, _ = ensure_runtime_deps()
     headers = {"User-Agent": USER_AGENT}
     timeout = aiohttp.ClientTimeout(total=max(5.0, args.source_timeout))
-    connector = aiohttp.TCPConnector(limit=0, ttl_dns_cache=300, enable_cleanup_closed=cleanup_closed_enabled())
+    connector = aiohttp.TCPConnector(limit=0, ttl_dns_cache=300, enable_cleanup_closed=True)
     semaphore = asyncio.Semaphore(max(1, args.source_workers))
 
     async def bounded_fetch(session, source: SourceSpec):
@@ -840,22 +965,23 @@ async def test_candidate(http_session, ProxyConnector, aiohttp, candidate: Proxy
     return True
 
 
-def status_line(tested: int, total: int, found: int, need: int) -> str:
+def status_line(tested: int, total: int, found: int, need: int, workers: int) -> str:
     tested_text = paint(f"Tested {tested}/{total}", Ansi.CYAN)
     working_text = paint(f"working={found}", Ansi.GREEN if found > 0 else Ansi.DIM)
     need_text = paint(f"need={need}", Ansi.YELLOW)
-    return f"{tested_text} | {working_text} | {need_text}"
+    workers_text = paint(f"concurrency={workers}", Ansi.MAGENTA)
+    return f"{tested_text} | {working_text} | {need_text} | {workers_text}"
 
 
 async def progress_loop(state: SharedState, total: int, workers: int) -> None:
     while not state.stop_event.is_set():
         async with state.result_lock:
-            line = status_line(state.tested, total, state.found, state.need)
+            line = status_line(state.tested, total, state.found, state.need, workers)
         print("\r" + line + " " * 10, end="", file=sys.stderr, flush=True)
         await asyncio.sleep(0.35)
 
     async with state.result_lock:
-        line = status_line(state.tested, total, state.found, state.need)
+        line = status_line(state.tested, total, state.found, state.need, workers)
     print("\r" + line + " " * 10, file=sys.stderr, flush=True)
 
 
@@ -904,7 +1030,7 @@ async def run_checks(candidates: Sequence[ProxyCandidate], args) -> Tuple[int, i
     maybe_raise_nofile_limit(args.workers)
 
     timeout = aiohttp.ClientTimeout(total=max(0.5, args.timeout))
-    connector = aiohttp.TCPConnector(limit=0, ttl_dns_cache=300, enable_cleanup_closed=cleanup_closed_enabled())
+    connector = aiohttp.TCPConnector(limit=0, ttl_dns_cache=300, enable_cleanup_closed=True)
     headers = {"User-Agent": USER_AGENT}
     state = SharedState(need=args.need)
 
@@ -1112,7 +1238,7 @@ def main() -> int:
         args.per_source_limit = auto_per_source_limit(args.need)
 
     try:
-        return run_async_entry(async_main(args))
+        return asyncio.run(async_main(args))
     except KeyboardInterrupt:
         print("\nInterrupted. Saved results remain in the output file.", file=sys.stderr)
         return 130
