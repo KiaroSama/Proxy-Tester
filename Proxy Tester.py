@@ -1,59 +1,49 @@
 #!/usr/bin/env python3
 """
-Fetch public proxies from multiple public sources, test them on the current
-machine/network, detect the working protocol, and save working results into one
-output file.
+Fetch public proxies from multiple GitHub sources, test them on the current
+machine/network, and write working proxies to a single text file immediately.
 
-This version:
-- asks how many working proxies you need
-- auto-installs missing dependencies only when required
-- uses aggressive concurrency
-- stops early after enough working proxies are found
-- writes a single mixed output file
+Highlights:
+- asks how many working proxies you need (default: 50)
+- checks/install runtime dependencies only when missing
+- uses high async concurrency for faster testing
+- saves each working proxy as soon as it is found
+- stops exactly at the requested number of saved proxies
+- prints colorized progress in the terminal
 """
 
 from __future__ import annotations
 
 import argparse
-import concurrent.futures as cf
+import asyncio
 import importlib
-import importlib.util
 import ipaddress
+import json
 import os
 import re
 import subprocess
 import sys
-import threading
 import time
-from dataclasses import dataclass, field
-from typing import Dict, Iterable, Iterator, List, NoReturn, Optional, Sequence, Set, Tuple
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import quote, urlsplit
 
 
-requests = None
-HAS_PYSOCKS = False
-USER_AGENT = "proxy-tester/3.0"
-PROTOCOLS: Tuple[str, ...] = ("http", "socks4", "socks5")
+USER_AGENT = "proxy-tester/5.0"
 DEFAULT_NEED = 50
-DEFAULT_TARGET_URLS: Tuple[str, ...] = (
-    "https://ec.europa.eu/taxation_customs/vies/",
-)
-DEFAULT_PROBE_URLS: Tuple[str, ...] = (
-    "http://httpbin.org/ip",
-    "https://api.ipify.org?format=json",
-    "https://httpbin.org/ip",
-)
-DEFAULT_IP_ECHO_URLS: Tuple[str, ...] = (
-    "https://api.ipify.org?format=json",
-    "https://httpbin.org/ip",
-    "https://ifconfig.me/ip",
-)
+DEFAULT_WORKERS = 1000
+DEFAULT_TIMEOUT = 3.0
+DEFAULT_SOURCE_TIMEOUT = 20.0
+DEFAULT_SOURCE_WORKERS = 24
+DEFAULT_PER_SOURCE_LIMIT = 0
+DEFAULT_TEST_URL = "https://ec.europa.eu/taxation_customs/vies/"
+DEFAULT_IP_URL = "https://api.ipify.org?format=json"
+TOKEN_SPLIT_RE = re.compile(r"[\s,;]+")
+IPV4_EXTRACT_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 HOSTNAME_RE = re.compile(
     r"^(?=.{1,253}$)(?!-)(?:[A-Za-z0-9-]{1,63}\.)*[A-Za-z0-9-]{1,63}$"
 )
-TOKEN_SPLIT_RE = re.compile(r"[\s,;]+")
-_thread_local = threading.local()
-_session_pool_size = 128
 
 
 @dataclass(frozen=True)
@@ -61,89 +51,68 @@ class SourceSpec:
     name: str
     urls: Tuple[str, ...]
     scheme_hint: Optional[str] = None
+    max_items: int = 0
 
 
-@dataclass
+@dataclass(frozen=True)
 class ProxyCandidate:
+    scheme: str
     host: str
     port: int
     username: Optional[str] = None
     password: Optional[str] = None
-    sources: Set[str] = field(default_factory=set)
-    hints: Set[str] = field(default_factory=set)
 
     @property
-    def endpoint(self) -> str:
-        return f"{format_host(self.host)}:{self.port}"
+    def key(self) -> Tuple[str, str, int, Optional[str], Optional[str]]:
+        return (self.scheme, self.host, self.port, self.username, self.password)
 
     @property
-    def key(self) -> Tuple[str, int, Optional[str], Optional[str]]:
-        return (self.host, self.port, self.username, self.password)
-
-    def proxy_url(self, scheme: str) -> str:
+    def proxy_url(self) -> str:
         auth = ""
         if self.username is not None:
             auth = quote(self.username, safe="")
             if self.password is not None:
                 auth += ":" + quote(self.password, safe="")
             auth += "@"
-        return f"{scheme}://{auth}{format_host(self.host)}:{self.port}"
+        return f"{self.scheme}://{auth}{format_host(self.host)}:{self.port}"
 
 
 @dataclass
-class SchemeResult:
-    scheme: str
-    latency_ms: float
-    exit_ip: Optional[str]
-    ip_changed: Optional[bool]
+class SourceResult:
+    source: SourceSpec
+    count: int
+    error: Optional[str] = None
 
 
-@dataclass
-class CandidateResult:
-    candidate: ProxyCandidate
-    results: List[SchemeResult]
+class Ansi:
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    RED = "\033[31m"
+    GREEN = "\033[32m"
+    YELLOW = "\033[33m"
+    BLUE = "\033[34m"
+    MAGENTA = "\033[35m"
+    CYAN = "\033[36m"
 
 
-@dataclass
-class WorkingProxy:
-    proxy_url: str
-    scheme: str
-    latency_ms: float
-    endpoint: str
-    exit_ip: Optional[str]
-    source_count: int
+USE_COLOR = sys.stderr.isatty() and not os.environ.get("NO_COLOR")
 
 
-@dataclass
-class Settings:
-    need_count: int
-    workers: int
-    max_pending: int
-    connect_timeout: float
-    read_timeout: float
-    retries: int
-    protocols: Tuple[str, ...]
-    verify_protocol: bool
-    allow_multi_scheme: bool
-    probe_urls: Tuple[str, ...]
-    target_urls: Tuple[str, ...]
-    target_mode: str
-    skip_target_check: bool
-    require_ip_change: bool
-    baseline_ip: Optional[str]
-
-    @property
-    def request_timeout(self) -> Tuple[float, float]:
-        return (self.connect_timeout, self.read_timeout)
+def paint(text: str, code: str) -> str:
+    if not USE_COLOR:
+        return text
+    return f"{code}{text}{Ansi.RESET}"
 
 
-BUILTIN_SOURCES: Tuple[SourceSpec, ...] = (
+SOURCES: Tuple[SourceSpec, ...] = (
     SourceSpec(
         name="proxifly_http",
         urls=(
             "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/http/data.txt",
         ),
         scheme_hint="http",
+        max_items=6000,
     ),
     SourceSpec(
         name="proxifly_socks4",
@@ -151,6 +120,7 @@ BUILTIN_SOURCES: Tuple[SourceSpec, ...] = (
             "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/socks4/data.txt",
         ),
         scheme_hint="socks4",
+        max_items=5000,
     ),
     SourceSpec(
         name="proxifly_socks5",
@@ -158,6 +128,7 @@ BUILTIN_SOURCES: Tuple[SourceSpec, ...] = (
             "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/socks5/data.txt",
         ),
         scheme_hint="socks5",
+        max_items=5000,
     ),
     SourceSpec(
         name="monosans_http",
@@ -165,6 +136,7 @@ BUILTIN_SOURCES: Tuple[SourceSpec, ...] = (
             "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
         ),
         scheme_hint="http",
+        max_items=6000,
     ),
     SourceSpec(
         name="monosans_socks4",
@@ -172,6 +144,7 @@ BUILTIN_SOURCES: Tuple[SourceSpec, ...] = (
             "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks4.txt",
         ),
         scheme_hint="socks4",
+        max_items=5000,
     ),
     SourceSpec(
         name="monosans_socks5",
@@ -179,6 +152,7 @@ BUILTIN_SOURCES: Tuple[SourceSpec, ...] = (
             "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt",
         ),
         scheme_hint="socks5",
+        max_items=5000,
     ),
     SourceSpec(
         name="roosterkid_http",
@@ -186,6 +160,7 @@ BUILTIN_SOURCES: Tuple[SourceSpec, ...] = (
             "https://raw.githubusercontent.com/roosterkid/openproxylist/main/HTTPS_RAW.txt",
         ),
         scheme_hint="http",
+        max_items=5000,
     ),
     SourceSpec(
         name="roosterkid_socks4",
@@ -193,6 +168,7 @@ BUILTIN_SOURCES: Tuple[SourceSpec, ...] = (
             "https://raw.githubusercontent.com/roosterkid/openproxylist/main/SOCKS4_RAW.txt",
         ),
         scheme_hint="socks4",
+        max_items=5000,
     ),
     SourceSpec(
         name="roosterkid_socks5",
@@ -200,6 +176,7 @@ BUILTIN_SOURCES: Tuple[SourceSpec, ...] = (
             "https://raw.githubusercontent.com/roosterkid/openproxylist/main/SOCKS5_RAW.txt",
         ),
         scheme_hint="socks5",
+        max_items=5000,
     ),
     SourceSpec(
         name="speedx_http",
@@ -208,6 +185,7 @@ BUILTIN_SOURCES: Tuple[SourceSpec, ...] = (
             "https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/http.txt",
         ),
         scheme_hint="http",
+        max_items=5000,
     ),
     SourceSpec(
         name="speedx_socks4",
@@ -216,6 +194,7 @@ BUILTIN_SOURCES: Tuple[SourceSpec, ...] = (
             "https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/socks4.txt",
         ),
         scheme_hint="socks4",
+        max_items=5000,
     ),
     SourceSpec(
         name="speedx_socks5",
@@ -224,6 +203,7 @@ BUILTIN_SOURCES: Tuple[SourceSpec, ...] = (
             "https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/socks5.txt",
         ),
         scheme_hint="socks5",
+        max_items=5000,
     ),
     SourceSpec(
         name="zaeem_http",
@@ -232,6 +212,7 @@ BUILTIN_SOURCES: Tuple[SourceSpec, ...] = (
             "https://raw.githubusercontent.com/Zaeem20/FREE_PROXIES_LIST/master/https.txt",
         ),
         scheme_hint="http",
+        max_items=6000,
     ),
     SourceSpec(
         name="zaeem_socks4",
@@ -239,6 +220,7 @@ BUILTIN_SOURCES: Tuple[SourceSpec, ...] = (
             "https://raw.githubusercontent.com/Zaeem20/FREE_PROXIES_LIST/master/socks4.txt",
         ),
         scheme_hint="socks4",
+        max_items=5000,
     ),
     SourceSpec(
         name="zaeem_socks5",
@@ -246,6 +228,7 @@ BUILTIN_SOURCES: Tuple[SourceSpec, ...] = (
             "https://raw.githubusercontent.com/Zaeem20/FREE_PROXIES_LIST/master/socks5.txt",
         ),
         scheme_hint="socks5",
+        max_items=5000,
     ),
     SourceSpec(
         name="vakhov_http",
@@ -254,6 +237,7 @@ BUILTIN_SOURCES: Tuple[SourceSpec, ...] = (
             "https://vakhov.github.io/fresh-proxy-list/https.txt",
         ),
         scheme_hint="http",
+        max_items=6000,
     ),
     SourceSpec(
         name="vakhov_socks4",
@@ -261,6 +245,7 @@ BUILTIN_SOURCES: Tuple[SourceSpec, ...] = (
             "https://vakhov.github.io/fresh-proxy-list/socks4.txt",
         ),
         scheme_hint="socks4",
+        max_items=5000,
     ),
     SourceSpec(
         name="vakhov_socks5",
@@ -268,6 +253,112 @@ BUILTIN_SOURCES: Tuple[SourceSpec, ...] = (
             "https://vakhov.github.io/fresh-proxy-list/socks5.txt",
         ),
         scheme_hint="socks5",
+        max_items=5000,
+    ),
+    SourceSpec(
+        name="fyvri_http",
+        urls=(
+            "https://raw.githubusercontent.com/fyvri/fresh-proxy-list/main/http.txt",
+            "https://raw.githubusercontent.com/fyvri/fresh-proxy-list/main/https.txt",
+        ),
+        scheme_hint="http",
+        max_items=6000,
+    ),
+    SourceSpec(
+        name="fyvri_socks4",
+        urls=(
+            "https://raw.githubusercontent.com/fyvri/fresh-proxy-list/main/socks4.txt",
+        ),
+        scheme_hint="socks4",
+        max_items=5000,
+    ),
+    SourceSpec(
+        name="fyvri_socks5",
+        urls=(
+            "https://raw.githubusercontent.com/fyvri/fresh-proxy-list/main/socks5.txt",
+        ),
+        scheme_hint="socks5",
+        max_items=5000,
+    ),
+    SourceSpec(
+        name="dpangestuw_http",
+        urls=(
+            "https://raw.githubusercontent.com/dpangestuw/Free-Proxy/refs/heads/main/http_proxies.txt",
+        ),
+        scheme_hint="http",
+        max_items=6000,
+    ),
+    SourceSpec(
+        name="dpangestuw_socks4",
+        urls=(
+            "https://raw.githubusercontent.com/dpangestuw/Free-Proxy/refs/heads/main/socks4_proxies.txt",
+        ),
+        scheme_hint="socks4",
+        max_items=5000,
+    ),
+    SourceSpec(
+        name="dpangestuw_socks5",
+        urls=(
+            "https://raw.githubusercontent.com/dpangestuw/Free-Proxy/refs/heads/main/socks5_proxies.txt",
+        ),
+        scheme_hint="socks5",
+        max_items=5000,
+    ),
+    SourceSpec(
+        name="joy_http",
+        urls=(
+            "https://raw.githubusercontent.com/thenasty1337/free-proxy-list/main/data/latest/types/http/proxies.txt",
+        ),
+        scheme_hint="http",
+        max_items=6000,
+    ),
+    SourceSpec(
+        name="joy_socks4",
+        urls=(
+            "https://raw.githubusercontent.com/thenasty1337/free-proxy-list/main/data/latest/types/socks4/proxies.txt",
+        ),
+        scheme_hint="socks4",
+        max_items=5000,
+    ),
+    SourceSpec(
+        name="joy_socks5",
+        urls=(
+            "https://raw.githubusercontent.com/thenasty1337/free-proxy-list/main/data/latest/types/socks5/proxies.txt",
+        ),
+        scheme_hint="socks5",
+        max_items=5000,
+    ),
+    SourceSpec(
+        name="kangproxy_raw",
+        urls=(
+            "https://raw.githubusercontent.com/officialputuid/KangProxy/KangProxy/xResults/RAW.txt",
+        ),
+        scheme_hint=None,
+        max_items=7000,
+    ),
+    SourceSpec(
+        name="gfp_http",
+        urls=(
+            "https://raw.githubusercontent.com/wiki/gfpcom/free-proxy-list/lists/http.txt",
+        ),
+        scheme_hint="http",
+        max_items=8000,
+    ),
+    SourceSpec(
+        name="gfp_socks4",
+        urls=(
+            "https://raw.githubusercontent.com/wiki/gfpcom/free-proxy-list/lists/socks4.txt",
+        ),
+        scheme_hint="socks4",
+        max_items=8000,
+    ),
+    SourceSpec(
+        name="gfp_socks5",
+        urls=(
+            "https://raw.githubusercontent.com/wiki/gfpcom/free-proxy-list/lists/socks5.txt",
+        ),
+        scheme_hint="socks5",
+        max_items=8000,
     ),
     SourceSpec(
         name="clarketm_http",
@@ -275,77 +366,96 @@ BUILTIN_SOURCES: Tuple[SourceSpec, ...] = (
             "https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt",
         ),
         scheme_hint="http",
+        max_items=4000,
     ),
     SourceSpec(
-        name="mishakorzik_all",
+        name="themiralay_http",
+        urls=(
+            "https://raw.githubusercontent.com/themiralay/Proxy-List-World/master/data.txt",
+        ),
+        scheme_hint="http",
+        max_items=1000,
+    ),
+    SourceSpec(
+        name="mishakorzik_http",
         urls=(
             "https://raw.githubusercontent.com/mishakorzik/Free-Proxy/main/proxy.txt",
             "https://raw.githubusercontent.com/mishakorzik/Free-Proxy/main/packages/Proxy.txt",
         ),
-        scheme_hint=None,
+        scheme_hint="http",
+        max_items=4000,
     ),
 )
 
 
-def fail(message: str, exit_code: int = 2) -> NoReturn:
-    print(f"ERROR: {message}", file=sys.stderr)
-    raise SystemExit(exit_code)
+def _python_version_ok() -> bool:
+    return sys.version_info >= (3, 8)
 
 
-def module_available(name: str) -> bool:
-    return importlib.util.find_spec(name) is not None
-
-
-def install_packages(packages: Sequence[str]) -> bool:
-    unique = [item for item in dict.fromkeys(packages) if item]
-    if not unique:
-        return True
-
+def _try_install(package: str) -> bool:
     commands = (
-        [sys.executable, "-m", "pip", "install", "--disable-pip-version-check", *unique],
-        [sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "--user", *unique],
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--disable-pip-version-check",
+            "--quiet",
+            package,
+        ],
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--disable-pip-version-check",
+            "--quiet",
+            "--user",
+            package,
+        ],
     )
     for command in commands:
         try:
-            subprocess.check_call(command)
+            subprocess.check_call(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             return True
         except Exception:
             continue
     return False
 
 
-def ensure_requests() -> None:
-    global requests
-    if requests is not None:
-        return
-    if not module_available("requests"):
-        print("Installing missing dependency: requests", file=sys.stderr)
-        if not install_packages(("requests",)):
-            fail("failed to install requests automatically.", exit_code=1)
-        importlib.invalidate_caches()
+def _import_or_install(import_name: str, package_name: Optional[str] = None):
     try:
-        import requests as imported_requests  # type: ignore
-    except Exception as exc:
-        fail(f"failed to import requests: {exc}", exit_code=1)
-    requests = imported_requests
+        return importlib.import_module(import_name)
+    except Exception:
+        package = package_name or import_name
+        print(f"Installing missing dependency: {package}", file=sys.stderr)
+        if not _try_install(package):
+            raise RuntimeError(f"Missing dependency '{package}' and auto-install failed.")
+        return importlib.import_module(import_name)
 
 
-HAS_PYSOCKS = module_available("socks")
+def ensure_runtime_deps():
+    aiohttp = _import_or_install("aiohttp")
+    aiohttp_socks = _import_or_install("aiohttp_socks", "aiohttp-socks")
+    return aiohttp, aiohttp_socks
 
 
-def ensure_socks_if_needed(protocols: Sequence[str]) -> None:
-    global HAS_PYSOCKS
-    if not any(proto.startswith("socks") for proto in protocols):
+def maybe_raise_nofile_limit(expected_connections: int) -> None:
+    try:
+        import resource
+    except Exception:
         return
-    if HAS_PYSOCKS:
+
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if hard == resource.RLIM_INFINITY:
+            target = max(soft, min(65535, expected_connections * 4 + 2048))
+        else:
+            target = min(hard, max(soft, expected_connections * 4 + 2048))
+        if target > soft:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+    except Exception:
         return
-    print("Installing missing dependency: PySocks", file=sys.stderr)
-    if not install_packages(("PySocks",)):
-        fail('failed to install PySocks automatically. Try: pip install "requests[socks]"', exit_code=1)
-    importlib.invalidate_caches()
-    HAS_PYSOCKS = module_available("socks")
-    if not HAS_PYSOCKS:
-        fail('PySocks is still unavailable. Try: pip install "requests[socks]"', exit_code=1)
 
 
 def normalize_scheme(value: Optional[str]) -> Optional[str]:
@@ -354,7 +464,7 @@ def normalize_scheme(value: Optional[str]) -> Optional[str]:
     value = value.strip().lower()
     if value == "https":
         return "http"
-    if value in PROTOCOLS:
+    if value in {"http", "socks4", "socks5"}:
         return value
     return None
 
@@ -366,7 +476,7 @@ def format_host(host: str) -> str:
 
 
 def normalize_host(host: str) -> Optional[str]:
-    host = host.strip().strip("[]").strip().lower()
+    host = host.strip().strip("[]").lower()
     if not host:
         return None
     try:
@@ -385,21 +495,17 @@ def valid_port(value: str) -> Optional[int]:
 
 def strip_token(token: str) -> str:
     token = token.strip()
-    token = token.strip('"\'`<>(){}')
+    token = token.strip("\"'`<>(){}")
     token = token.strip(",;")
     if not (token.startswith("[") and "]:" in token):
         token = token.strip("[]")
-    token = token.rstrip(".:")
-    return token
+    return token.rstrip(".:")
 
 
 def parse_host_port(raw: str) -> Optional[Tuple[str, int, Optional[str], Optional[str]]]:
     token = strip_token(raw)
     if not token or token.startswith("#"):
         return None
-
-    username: Optional[str] = None
-    password: Optional[str] = None
 
     if token.startswith("//"):
         token = "http:" + token
@@ -413,483 +519,393 @@ def parse_host_port(raw: str) -> Optional[Tuple[str, int, Optional[str], Optiona
             return None
         if not host or port is None:
             return None
-        normalized = normalize_host(host)
-        if normalized is None:
+        normalized_host = normalize_host(host)
+        if not normalized_host:
             return None
-        return normalized, port, split.username, split.password
+        return normalized_host, port, split.username, split.password
 
-    host_part = token
+    username: Optional[str] = None
+    password: Optional[str] = None
+    host_port = token
+
     if "@" in token:
-        auth_part, host_part = token.rsplit("@", 1)
-        if ":" in auth_part:
-            username, password = auth_part.split(":", 1)
+        auth, _, host_port = token.rpartition("@")
+        if ":" in auth:
+            username, password = auth.split(":", 1)
         else:
-            username = auth_part
-            password = None
+            username, password = auth, None
 
-    if host_part.startswith("[") and "]:" in host_part:
-        host, port_text = host_part[1:].split("]:", 1)
+    if host_port.startswith("[") and "]:" in host_port:
+        close = host_port.find("]")
+        host = host_port[1:close]
+        port_text = host_port[close + 2 :]
     else:
-        if ":" not in host_part:
+        if ":" not in host_port:
             return None
-        host, port_text = host_part.rsplit(":", 1)
+        host, port_text = host_port.rsplit(":", 1)
 
+    normalized_host = normalize_host(host)
     port = valid_port(port_text)
-    if port is None:
+    if not normalized_host or port is None:
         return None
-    normalized = normalize_host(host)
-    if normalized is None:
-        return None
-    return normalized, port, username, password
+
+    return normalized_host, port, username, password
 
 
-def parse_proxy_token(raw: str, fallback_scheme: Optional[str]) -> Optional[Tuple[Optional[str], ProxyCandidate]]:
-    token = strip_token(raw)
+def parse_proxy_token(token: str, default_scheme: Optional[str]) -> Optional[ProxyCandidate]:
+    token = strip_token(token)
     if not token or token.startswith("#"):
         return None
 
-    scheme_hint = fallback_scheme
+    scheme = default_scheme
     if "://" in token:
-        split = urlsplit(token)
-        scheme_hint = normalize_scheme(split.scheme) or fallback_scheme
-
-    parsed = parse_host_port(token)
-    if parsed is None:
+        scheme = normalize_scheme(urlsplit(token).scheme)
+    if not scheme:
         return None
 
+    parsed = parse_host_port(token)
+    if not parsed:
+        return None
     host, port, username, password = parsed
-    return scheme_hint, ProxyCandidate(host=host, port=port, username=username, password=password)
-
-
-def parse_proxy_text(text: str, fallback_scheme: Optional[str], max_items: int) -> List[ProxyCandidate]:
-    seen: Set[Tuple[str, int, Optional[str], Optional[str]]] = set()
-    results: List[ProxyCandidate] = []
-
-    for token in TOKEN_SPLIT_RE.split(text):
-        parsed = parse_proxy_token(token, fallback_scheme=fallback_scheme)
-        if parsed is None:
-            continue
-        scheme_hint, candidate = parsed
-        if candidate.key in seen:
-            continue
-        seen.add(candidate.key)
-        if scheme_hint:
-            candidate.hints.add(scheme_hint)
-        results.append(candidate)
-        if max_items > 0 and len(results) >= max_items:
-            break
-
-    return results
-
-
-def configure_session_pool(workers: int) -> None:
-    global _session_pool_size
-    _session_pool_size = max(64, min(2048, workers * 4))
-
-
-def build_session():
-    session = requests.Session()
-    session.trust_env = False
-    session.headers.update({"User-Agent": USER_AGENT})
-    adapter = requests.adapters.HTTPAdapter(
-        pool_connections=_session_pool_size,
-        pool_maxsize=_session_pool_size,
-        max_retries=0,
-        pool_block=False,
+    return ProxyCandidate(
+        scheme=scheme,
+        host=host,
+        port=port,
+        username=username,
+        password=password,
     )
-    session.mount("http://", adapter)
-    session.mount("https://", adapter)
-    return session
-
-
-def direct_session():
-    return build_session()
-
-
-def worker_session():
-    session = getattr(_thread_local, "session", None)
-    if session is None:
-        session = build_session()
-        _thread_local.session = session
-    return session
-
-
-def download_text(urls: Sequence[str], connect_timeout: float, read_timeout: float, retries: int) -> str:
-    last_error: Optional[BaseException] = None
-    for url in urls:
-        for attempt in range(retries):
-            try:
-                with direct_session() as session:
-                    response = session.get(
-                        url,
-                        timeout=(connect_timeout, read_timeout),
-                        allow_redirects=True,
-                    )
-                    response.raise_for_status()
-                    response.encoding = response.encoding or "utf-8"
-                    return response.text
-            except BaseException as exc:
-                last_error = exc
-                if attempt + 1 < retries:
-                    time.sleep(min(0.25 * (2 ** attempt), 1.5))
-    raise RuntimeError(f"all download attempts failed: {last_error}")
-
-
-def source_catalog() -> Dict[str, SourceSpec]:
-    return {source.name: source for source in BUILTIN_SOURCES}
-
-
-def selected_sources(names: Optional[Sequence[str]]) -> List[SourceSpec]:
-    catalog = source_catalog()
-    if not names:
-        return list(BUILTIN_SOURCES)
-
-    result: List[SourceSpec] = []
-    for name in names:
-        if name not in catalog:
-            fail(f"unknown source '{name}'. Use --list-sources to view valid names.")
-        result.append(catalog[name])
-    return result
-
-
-def fetch_one_source(
-    source: SourceSpec,
-    connect_timeout: float,
-    read_timeout: float,
-    retries: int,
-    max_per_source: int,
-) -> Tuple[str, List[ProxyCandidate], Dict[str, object]]:
-    stat: Dict[str, object] = {
-        "hint": source.scheme_hint,
-        "urls": list(source.urls),
-        "downloaded": False,
-        "parsed": 0,
-        "unique_added": 0,
-        "error": None,
-    }
-    try:
-        text = download_text(
-            source.urls,
-            connect_timeout=connect_timeout,
-            read_timeout=read_timeout,
-            retries=retries,
-        )
-        parsed = parse_proxy_text(text, fallback_scheme=source.scheme_hint, max_items=max_per_source)
-        stat["downloaded"] = True
-        stat["parsed"] = len(parsed)
-        return source.name, parsed, stat
-    except BaseException as exc:
-        stat["error"] = str(exc)
-        return source.name, [], stat
-
-
-def fetch_candidates(
-    sources: Sequence[SourceSpec],
-    connect_timeout: float,
-    read_timeout: float,
-    retries: int,
-    max_per_source: int,
-    global_limit: int,
-    verbose: bool,
-) -> Tuple[List[ProxyCandidate], Dict[str, Dict[str, object]]]:
-    merged: Dict[Tuple[str, int, Optional[str], Optional[str]], ProxyCandidate] = {}
-    stats: Dict[str, Dict[str, object]] = {}
-
-    fetch_workers = max(4, min(24, len(sources)))
-    with cf.ThreadPoolExecutor(max_workers=fetch_workers) as executor:
-        futures = {
-            executor.submit(
-                fetch_one_source,
-                source,
-                connect_timeout,
-                read_timeout,
-                retries,
-                max_per_source,
-            ): source
-            for source in sources
-        }
-        for future in cf.as_completed(futures):
-            source = futures[future]
-            name, parsed, stat = future.result()
-            added = 0
-            for candidate in parsed:
-                existing = merged.get(candidate.key)
-                if existing is None:
-                    existing = ProxyCandidate(
-                        host=candidate.host,
-                        port=candidate.port,
-                        username=candidate.username,
-                        password=candidate.password,
-                    )
-                    merged[candidate.key] = existing
-                    added += 1
-                existing.sources.add(name)
-                existing.hints.update(candidate.hints)
-            stat["unique_added"] = added
-            stats[name] = stat
-            if verbose:
-                if stat["error"]:
-                    print(f"Failed {source.name}: {stat['error']}", file=sys.stderr)
-                else:
-                    print(
-                        f"Fetched {source.name}: parsed={stat['parsed']} unique_added={stat['unique_added']}",
-                        file=sys.stderr,
-                    )
-
-    candidates = list(merged.values())
-    candidates.sort(
-        key=lambda item: (
-            -len(item.sources),
-            -len(item.hints),
-            item.port,
-            item.host,
-        )
-    )
-    if global_limit > 0:
-        candidates = candidates[:global_limit]
-    return candidates, stats
-
-
-def proxy_mapping(scheme: str, candidate: ProxyCandidate) -> Dict[str, str]:
-    if scheme == "socks5":
-        proxy_url = candidate.proxy_url("socks5h")
-    elif scheme == "socks4":
-        proxy_url = candidate.proxy_url("socks4a")
-    else:
-        proxy_url = candidate.proxy_url("http")
-    return {"http": proxy_url, "https": proxy_url}
-
-
-def read_small_text(response, limit: int = 4096) -> str:
-    chunks: List[bytes] = []
-    size = 0
-    try:
-        for chunk in response.iter_content(chunk_size=512):
-            if not chunk:
-                continue
-            chunks.append(chunk)
-            size += len(chunk)
-            if size >= limit:
-                break
-    finally:
-        response.close()
-    return b"".join(chunks).decode(response.encoding or "utf-8", errors="replace")
 
 
 def extract_ip(text: str) -> Optional[str]:
-    for token in re.split(r"[^0-9A-Za-z:\.\[\]]+", text):
-        token = token.strip().strip("[]")
-        if not token:
-            continue
-        try:
-            return str(ipaddress.ip_address(token))
-        except ValueError:
-            continue
-    return None
-
-
-def request_via_proxy(
-    session,
-    candidate: ProxyCandidate,
-    scheme: str,
-    url: str,
-    timeout: Tuple[float, float],
-    need_ip: bool,
-) -> Tuple[bool, Optional[float], Optional[str]]:
-    started = time.perf_counter()
-    response = None
     try:
-        response = session.get(
-            url,
-            proxies=proxy_mapping(scheme, candidate),
-            timeout=timeout,
-            allow_redirects=True,
-            stream=True,
-        )
-        if response.status_code >= 400:
-            response.close()
-            return False, None, None
-        if need_ip:
-            text = read_small_text(response, limit=4096)
-            ip_text = extract_ip(text)
-            if ip_text is None:
-                return False, None, None
-            return True, (time.perf_counter() - started) * 1000.0, ip_text
-        try:
-            next(response.iter_content(chunk_size=256), b"")
-        finally:
-            response.close()
-        return True, (time.perf_counter() - started) * 1000.0, None
+        data = json.loads(text)
+        for key in ("ip", "origin"):
+            value = data.get(key)
+            if isinstance(value, str):
+                for part in [x.strip() for x in value.split(",") if x.strip()]:
+                    if IPV4_EXTRACT_RE.fullmatch(part):
+                        return part
     except Exception:
-        if response is not None:
-            response.close()
-        return False, None, None
+        pass
+
+    match = IPV4_EXTRACT_RE.search(text)
+    return match.group(0) if match else None
 
 
-def protocol_order(candidate: ProxyCandidate, settings: Settings) -> List[str]:
-    if not settings.verify_protocol and candidate.hints:
-        hinted = [scheme for scheme in settings.protocols if scheme in candidate.hints]
-        return hinted or list(settings.protocols)
-    hinted = [scheme for scheme in settings.protocols if scheme in candidate.hints]
-    remaining = [scheme for scheme in settings.protocols if scheme not in candidate.hints]
-    return hinted + remaining
+async def read_text_tokens(response, source: SourceSpec, per_source_limit: int) -> List[ProxyCandidate]:
+    limit = source.max_items or per_source_limit
+    if source.max_items and per_source_limit > 0:
+        limit = min(source.max_items, per_source_limit)
+    elif per_source_limit > 0:
+        limit = per_source_limit
+    if limit <= 0:
+        limit = 1_000_000
 
+    found: List[ProxyCandidate] = []
+    seen = set()
+    buffer = ""
 
-def probe_scheme(session, candidate: ProxyCandidate, scheme: str, settings: Settings, stop_event: threading.Event) -> Optional[Tuple[float, Optional[str]]]:
-    for url in settings.probe_urls:
-        if stop_event.is_set():
-            return None
-        ok, latency_ms, exit_ip = request_via_proxy(
-            session=session,
-            candidate=candidate,
-            scheme=scheme,
-            url=url,
-            timeout=settings.request_timeout,
-            need_ip=True,
-        )
-        if ok and latency_ms is not None:
-            return latency_ms, exit_ip
-    return None
-
-
-def target_check(session, candidate: ProxyCandidate, scheme: str, settings: Settings, stop_event: threading.Event) -> bool:
-    if settings.skip_target_check or not settings.target_urls:
-        return True
-
-    matched = 0
-    for url in settings.target_urls:
-        if stop_event.is_set():
-            return False
-        ok, _, _ = request_via_proxy(
-            session=session,
-            candidate=candidate,
-            scheme=scheme,
-            url=url,
-            timeout=settings.request_timeout,
-            need_ip=False,
-        )
-        if ok:
-            matched += 1
-            if settings.target_mode == "any":
-                return True
-        elif settings.target_mode == "all":
-            return False
-
-    if settings.target_mode == "all":
-        return matched == len(settings.target_urls)
-    return matched > 0
-
-
-def test_candidate(candidate: ProxyCandidate, settings: Settings, stop_event: threading.Event) -> CandidateResult:
-    if stop_event.is_set():
-        return CandidateResult(candidate=candidate, results=[])
-
-    session = worker_session()
-    results: List[SchemeResult] = []
-
-    for scheme in protocol_order(candidate, settings):
-        if stop_event.is_set():
-            break
-        if scheme != "http" and not HAS_PYSOCKS:
-            continue
-
-        probe = probe_scheme(session=session, candidate=candidate, scheme=scheme, settings=settings, stop_event=stop_event)
-        if probe is None:
-            continue
-        latency_ms, exit_ip = probe
-
-        ip_changed: Optional[bool] = None
-        if settings.baseline_ip and exit_ip:
-            ip_changed = exit_ip != settings.baseline_ip
-            if settings.require_ip_change and not ip_changed:
+    async for chunk in response.content.iter_chunked(65536):
+        buffer += chunk.decode("utf-8", errors="ignore")
+        parts = TOKEN_SPLIT_RE.split(buffer)
+        buffer = parts.pop() if parts else ""
+        for token in parts:
+            candidate = parse_proxy_token(token, source.scheme_hint)
+            if candidate is None:
                 continue
+            if candidate.key in seen:
+                continue
+            seen.add(candidate.key)
+            found.append(candidate)
+            if len(found) >= limit:
+                return found
 
-        if not target_check(
-            session=session,
-            candidate=candidate,
-            scheme=scheme,
-            settings=settings,
-            stop_event=stop_event,
-        ):
-            continue
+    if buffer:
+        candidate = parse_proxy_token(buffer, source.scheme_hint)
+        if candidate is not None and candidate.key not in seen:
+            found.append(candidate)
 
-        results.append(
-            SchemeResult(
-                scheme=scheme,
-                latency_ms=latency_ms,
-                exit_ip=exit_ip,
-                ip_changed=ip_changed,
-            )
-        )
-
-        if results and not settings.allow_multi_scheme:
-            break
-
-    return CandidateResult(candidate=candidate, results=results)
+    return found[:limit]
 
 
-def detect_public_ip(connect_timeout: float, read_timeout: float) -> Optional[str]:
-    with direct_session() as session:
-        for url in DEFAULT_IP_ECHO_URLS:
-            try:
-                response = session.get(url, timeout=(connect_timeout, read_timeout), stream=True)
-                if response.status_code >= 400:
-                    response.close()
+async def fetch_one_source(session, source: SourceSpec, per_source_limit: int) -> Tuple[SourceResult, List[ProxyCandidate]]:
+    last_error: Optional[str] = None
+    for url in source.urls:
+        try:
+            async with session.get(url, allow_redirects=True) as response:
+                if response.status >= 400:
+                    last_error = f"HTTP {response.status}"
                     continue
-                text = read_small_text(response, limit=4096)
-                ip_value = extract_ip(text)
-                if ip_value:
-                    return ip_value
-            except Exception:
-                continue
-    return None
+                items = await read_text_tokens(response, source, per_source_limit)
+                return SourceResult(source=source, count=len(items), error=None), items
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            last_error = str(exc)
+    return SourceResult(source=source, count=0, error=last_error or "download failed"), []
 
 
-def iter_completed(
-    executor: cf.ThreadPoolExecutor,
+async def fetch_all_sources(args) -> Tuple[List[ProxyCandidate], List[SourceResult]]:
+    aiohttp, _ = ensure_runtime_deps()
+    headers = {"User-Agent": USER_AGENT}
+    timeout = aiohttp.ClientTimeout(total=max(5.0, args.source_timeout))
+    connector = aiohttp.TCPConnector(limit=0, ttl_dns_cache=300, enable_cleanup_closed=True)
+    semaphore = asyncio.Semaphore(max(1, args.source_workers))
+
+    async def bounded_fetch(session, source: SourceSpec):
+        async with semaphore:
+            return await fetch_one_source(session, source, args.per_source_limit)
+
+    async with aiohttp.ClientSession(
+        connector=connector,
+        timeout=timeout,
+        headers=headers,
+        trust_env=False,
+    ) as session:
+        tasks = [asyncio.create_task(bounded_fetch(session, source)) for source in SOURCES]
+        gathered = await asyncio.gather(*tasks, return_exceptions=True)
+
+    ordered_lists: List[List[ProxyCandidate]] = []
+    results: List[SourceResult] = []
+    for source, item in zip(SOURCES, gathered):
+        if isinstance(item, Exception):
+            results.append(SourceResult(source=source, count=0, error=str(item)))
+            ordered_lists.append([])
+            continue
+        result, candidates = item
+        results.append(result)
+        ordered_lists.append(candidates)
+
+    merged: Dict[Tuple[str, str, int, Optional[str], Optional[str]], ProxyCandidate] = {}
+    for candidates in ordered_lists:
+        for candidate in candidates:
+            merged.setdefault(candidate.key, candidate)
+
+    return list(merged.values()), results
+
+
+class ResultWriter:
+    def __init__(self, path: str):
+        self.path = path
+        self.handle = None
+
+    def __enter__(self):
+        output_path = Path(self.path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text("", encoding="utf-8")
+        self.handle = output_path.open("a", encoding="utf-8", buffering=1, newline="\n")
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self.handle is not None:
+            self.handle.close()
+
+    def write_line(self, line: str) -> None:
+        if self.handle is None:
+            raise RuntimeError("Writer is not open.")
+        self.handle.write(line + "\n")
+        self.handle.flush()
+        try:
+            os.fsync(self.handle.fileno())
+        except Exception:
+            pass
+
+
+class SharedState:
+    def __init__(self, need: int):
+        self.need = need
+        self.tested = 0
+        self.found = 0
+        self.next_index = 0
+        self.seen_working = set()
+        self.stop_event = asyncio.Event()
+        self.index_lock = asyncio.Lock()
+        self.result_lock = asyncio.Lock()
+        self.started_at = time.time()
+
+
+async def read_small_text(response, limit: int = 2048) -> str:
+    data = await response.content.read(limit)
+    return data.decode("utf-8", errors="ignore")
+
+
+async def fetch_direct_ip(http_session, ip_url: str) -> Optional[str]:
+    try:
+        async with http_session.get(ip_url, allow_redirects=True) as response:
+            if response.status >= 400:
+                return None
+            return extract_ip(await read_small_text(response, limit=4096))
+    except Exception:
+        return None
+
+
+async def request_via_proxy(http_session, ProxyConnector, aiohttp, candidate: ProxyCandidate, url: str, timeout_s: float) -> Tuple[bool, Optional[str]]:
+    if candidate.scheme == "http":
+        try:
+            async with http_session.get(url, proxy=candidate.proxy_url, allow_redirects=True) as response:
+                if response.status >= 400:
+                    return False, None
+                return True, await read_small_text(response, limit=4096)
+        except Exception:
+            return False, None
+
+    try:
+        connector = ProxyConnector.from_url(candidate.proxy_url)
+        client_timeout = aiohttp.ClientTimeout(total=max(0.5, timeout_s))
+        async with aiohttp.ClientSession(
+            connector=connector,
+            timeout=client_timeout,
+            headers={"User-Agent": USER_AGENT},
+            trust_env=False,
+        ) as session:
+            async with session.get(url, allow_redirects=True) as response:
+                if response.status >= 400:
+                    return False, None
+                return True, await read_small_text(response, limit=4096)
+    except Exception:
+        return False, None
+
+
+async def test_candidate(http_session, ProxyConnector, aiohttp, candidate: ProxyCandidate, args, baseline_ip: Optional[str]) -> bool:
+    ok, _ = await request_via_proxy(http_session, ProxyConnector, aiohttp, candidate, args.test_url, args.timeout)
+    if not ok:
+        return False
+
+    if args.require_different_ip:
+        if not baseline_ip:
+            return False
+        ok, text = await request_via_proxy(http_session, ProxyConnector, aiohttp, candidate, args.ip_url, args.timeout)
+        if not ok or not text:
+            return False
+        observed_ip = extract_ip(text)
+        if not observed_ip or observed_ip == baseline_ip:
+            return False
+
+    return True
+
+
+def status_line(tested: int, total: int, found: int, need: int, workers: int) -> str:
+    tested_text = paint(f"Tested {tested}/{total}", Ansi.CYAN)
+    working_text = paint(f"working={found}", Ansi.GREEN if found > 0 else Ansi.DIM)
+    need_text = paint(f"need={need}", Ansi.YELLOW)
+    workers_text = paint(f"concurrency={workers}", Ansi.MAGENTA)
+    return f"{tested_text} | {working_text} | {need_text} | {workers_text}"
+
+
+async def progress_loop(state: SharedState, total: int, workers: int) -> None:
+    while not state.stop_event.is_set():
+        async with state.result_lock:
+            line = status_line(state.tested, total, state.found, state.need, workers)
+        print("\r" + line + " " * 10, end="", file=sys.stderr, flush=True)
+        await asyncio.sleep(0.35)
+
+    async with state.result_lock:
+        line = status_line(state.tested, total, state.found, state.need, workers)
+    print("\r" + line + " " * 10, file=sys.stderr, flush=True)
+
+
+async def worker_loop(
+    state: SharedState,
     candidates: Sequence[ProxyCandidate],
-    settings: Settings,
-    stop_event: threading.Event,
-) -> Iterator[CandidateResult]:
-    pending: Dict[cf.Future[CandidateResult], ProxyCandidate] = {}
-    iterator = iter(candidates)
+    http_session,
+    ProxyConnector,
+    aiohttp,
+    args,
+    baseline_ip: Optional[str],
+    writer: ResultWriter,
+) -> None:
+    while not state.stop_event.is_set():
+        async with state.index_lock:
+            if state.stop_event.is_set() or state.next_index >= len(candidates):
+                return
+            index = state.next_index
+            state.next_index += 1
 
-    while True:
-        while not stop_event.is_set() and len(pending) < settings.max_pending:
-            try:
-                candidate = next(iterator)
-            except StopIteration:
-                break
-            future = executor.submit(test_candidate, candidate, settings, stop_event)
-            pending[future] = candidate
+        candidate = candidates[index]
+        ok = await test_candidate(http_session, ProxyConnector, aiohttp, candidate, args, baseline_ip)
 
-        if stop_event.is_set():
-            for future in list(pending):
-                if future.cancel():
-                    pending.pop(future, None)
-
-        if not pending:
-            break
-
-        done, _ = cf.wait(pending.keys(), return_when=cf.FIRST_COMPLETED)
-        for future in done:
-            candidate = pending.pop(future, None)
-            if future.cancelled():
+        async with state.result_lock:
+            state.tested += 1
+            if not ok:
                 continue
+            proxy_url = candidate.proxy_url
+            if proxy_url in state.seen_working:
+                continue
+            if state.found >= state.need:
+                state.stop_event.set()
+                return
+            state.seen_working.add(proxy_url)
+            state.found += 1
+            writer.write_line(proxy_url)
+            if state.found >= state.need:
+                state.stop_event.set()
+                return
+
+
+async def run_checks(candidates: Sequence[ProxyCandidate], args) -> Tuple[int, int, float, Optional[str]]:
+    aiohttp, aiohttp_socks = ensure_runtime_deps()
+    ProxyConnector = aiohttp_socks.ProxyConnector
+
+    maybe_raise_nofile_limit(args.workers)
+
+    timeout = aiohttp.ClientTimeout(total=max(0.5, args.timeout))
+    connector = aiohttp.TCPConnector(limit=0, ttl_dns_cache=300, enable_cleanup_closed=True)
+    headers = {"User-Agent": USER_AGENT}
+    state = SharedState(need=args.need)
+
+    with ResultWriter(args.output) as writer:
+        async with aiohttp.ClientSession(
+            connector=connector,
+            timeout=timeout,
+            headers=headers,
+            trust_env=False,
+        ) as http_session:
+            baseline_ip = None
+            if args.require_different_ip:
+                baseline_ip = await fetch_direct_ip(http_session, args.ip_url)
+                if not baseline_ip:
+                    print(
+                        paint(
+                            "Warning: could not detect baseline IP, strict IP-change mode was disabled.",
+                            Ansi.YELLOW,
+                        ),
+                        file=sys.stderr,
+                    )
+                    args.require_different_ip = False
+
+            progress_task = asyncio.create_task(progress_loop(state, len(candidates), args.workers))
+            workers = [
+                asyncio.create_task(
+                    worker_loop(state, candidates, http_session, ProxyConnector, aiohttp, args, baseline_ip, writer)
+                )
+                for _ in range(max(1, args.workers))
+            ]
+            stop_waiter = asyncio.create_task(state.stop_event.wait())
+            gather_future = asyncio.gather(*workers, return_exceptions=True)
+
             try:
-                yield future.result()
-            except Exception:
-                if candidate is not None:
-                    yield CandidateResult(candidate=candidate, results=[])
+                done, _ = await asyncio.wait(
+                    {gather_future, stop_waiter},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if stop_waiter in done and not gather_future.done():
+                    for task in workers:
+                        task.cancel()
+                    await asyncio.gather(*workers, return_exceptions=True)
+                else:
+                    state.stop_event.set()
+            finally:
+                state.stop_event.set()
+                if not stop_waiter.done():
+                    stop_waiter.cancel()
+                    await asyncio.gather(stop_waiter, return_exceptions=True)
+                await asyncio.gather(progress_task, return_exceptions=True)
+
+    elapsed = time.time() - state.started_at
+    return state.tested, state.found, elapsed, baseline_ip
 
 
-def write_output(path: str, items: Iterable[WorkingProxy]) -> None:
-    with open(path, "w", encoding="utf-8", newline="\n") as handle:
-        for item in items:
-            handle.write(item.proxy_url + "\n")
-
-
-def prompt_need_count(default_need: int = DEFAULT_NEED) -> int:
+def prompt_for_need(default_need: int = DEFAULT_NEED) -> int:
     if not sys.stdin or not sys.stdin.isatty():
         return default_need
 
@@ -910,307 +926,141 @@ def prompt_need_count(default_need: int = DEFAULT_NEED) -> int:
             print("Please enter a valid integer.")
 
 
-def default_workers(need_count: int) -> int:
-    cpu = os.cpu_count() or 4
-    aggressive = max(cpu * 48, need_count * 5)
-    return max(128, min(512, aggressive))
+def auto_per_source_limit(need: int) -> int:
+    return min(12000, max(3000, need * 120))
 
 
-def parser() -> argparse.ArgumentParser:
-    ap = argparse.ArgumentParser(
-        description="Fetch and validate public proxies on the machine where this script runs."
+def print_source_summary(results: Iterable[SourceResult], total_unique: int) -> None:
+    ok_count = sum(1 for item in results if not item.error)
+    source_total = sum(1 for _ in results)
+    print(
+        f"{paint('Fetched sources', Ansi.BLUE)}: {ok_count}/{source_total} | "
+        f"{paint('unique candidates', Ansi.CYAN)}: {total_unique:,}",
+        file=sys.stderr,
     )
-    ap.add_argument("-o", "--output", default="working_proxies.txt", help="Single output file.")
+
+
+def list_sources() -> None:
+    for item in SOURCES:
+        hint = item.scheme_hint or "mixed"
+        print(f"{item.name}\t{hint}\t{item.urls[0]}")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(
+        description="Fetch public proxies from many GitHub sources and save working ones to one file."
+    )
+    ap.add_argument("--need", type=int, default=0, help="How many working proxies to save.")
     ap.add_argument(
-        "--need",
-        type=int,
-        default=0,
-        help=f"How many working proxies to save. 0 means prompt or default {DEFAULT_NEED}.",
+        "-o",
+        "--output",
+        default="working_proxies.txt",
+        help="Single output file for working proxies.",
     )
     ap.add_argument(
         "--workers",
         type=int,
-        default=0,
-        help="Concurrent tests. 0 uses an aggressive automatic value.",
+        default=DEFAULT_WORKERS,
+        help=f"Concurrent proxy checks (default: {DEFAULT_WORKERS}).",
     )
     ap.add_argument(
-        "--connect-timeout",
+        "--timeout",
         type=float,
-        default=2.5,
-        help="Connect timeout per request in seconds.",
+        default=DEFAULT_TIMEOUT,
+        help=f"Per-request timeout in seconds (default: {DEFAULT_TIMEOUT}).",
     )
     ap.add_argument(
-        "--read-timeout",
-        type=float,
-        default=3.5,
-        help="Read timeout per request in seconds.",
+        "--test-url",
+        default=DEFAULT_TEST_URL,
+        help="URL used to verify proxy reachability.",
     )
     ap.add_argument(
-        "--retries",
-        type=int,
-        default=2,
-        help="Retries per source download.",
+        "--ip-url",
+        default=DEFAULT_IP_URL,
+        help="URL used to detect public IP in strict mode.",
     )
     ap.add_argument(
-        "--protocols",
-        default="http,socks4,socks5",
-        help="Comma-separated protocols to test.",
-    )
-    ap.add_argument(
-        "--probe-url",
-        action="append",
-        default=[],
-        help="Protocol probe URL. Repeat to add more.",
-    )
-    ap.add_argument(
-        "--target-url",
-        action="append",
-        default=[],
-        help="Target URL that a proxy must reach. Repeat to add more.",
-    )
-    ap.add_argument(
-        "--target-mode",
-        choices=("any", "all"),
-        default="any",
-        help="Require any or all target URLs to work.",
-    )
-    ap.add_argument(
-        "--skip-target-check",
-        action="store_true",
-        help="Only validate the protocol and skip final target-site validation.",
-    )
-    ap.add_argument(
-        "--require-ip-change",
+        "--require-different-ip",
         action="store_true",
         help="Only keep proxies that change the observed public IP.",
     )
     ap.add_argument(
-        "--verify-protocol",
-        dest="verify_protocol",
-        action="store_true",
-        default=True,
-        help="Try fallback protocols if the source hint is wrong.",
+        "--source-timeout",
+        type=float,
+        default=DEFAULT_SOURCE_TIMEOUT,
+        help=f"Timeout for source downloads (default: {DEFAULT_SOURCE_TIMEOUT}).",
     )
     ap.add_argument(
-        "--no-verify-protocol",
-        dest="verify_protocol",
-        action="store_false",
-        help="Trust source hints and do not try fallback protocols.",
-    )
-    ap.add_argument(
-        "--allow-multi-scheme",
-        action="store_true",
-        help="Keep multiple working schemes for the same endpoint.",
-    )
-    ap.add_argument(
-        "--max-per-source",
+        "--source-workers",
         type=int,
-        default=5000,
-        help="Maximum proxies parsed from each source before testing.",
+        default=DEFAULT_SOURCE_WORKERS,
+        help=f"Concurrent source downloads (default: {DEFAULT_SOURCE_WORKERS}).",
     )
     ap.add_argument(
-        "--limit",
+        "--per-source-limit",
         type=int,
-        default=0,
-        help="Global maximum number of unique endpoints to test. 0 means no limit.",
-    )
-    ap.add_argument(
-        "--source",
-        action="append",
-        default=[],
-        help="Enable only selected built-in source names. Repeat to add more.",
+        default=DEFAULT_PER_SOURCE_LIMIT,
+        help="Max parsed proxies per source. 0 = automatic.",
     )
     ap.add_argument(
         "--list-sources",
         action="store_true",
-        help="Print built-in source names and exit.",
-    )
-    ap.add_argument(
-        "--verbose",
-        action="store_true",
-        help="Print more progress information.",
+        help="Print built-in sources and exit.",
     )
     return ap
 
 
-def print_sources() -> None:
-    for source in BUILTIN_SOURCES:
-        hint = source.scheme_hint or "mixed"
-        print(f"{source.name:<20} hint={hint:<7} urls={len(source.urls)}")
+async def async_main(args) -> int:
+    candidates, source_results = await fetch_all_sources(args)
+    if not candidates:
+        print(paint("ERROR: no candidates fetched from any source.", Ansi.RED), file=sys.stderr)
+        return 1
 
+    print_source_summary(source_results, len(candidates))
 
-def validate_protocol_list(value: str) -> Tuple[str, ...]:
-    raw_parts = [part.strip() for part in value.split(",") if part.strip()]
-    if not raw_parts:
-        fail("--protocols is empty.")
+    tested, found, elapsed, baseline_ip = await run_checks(candidates, args)
+    abs_out = os.path.abspath(args.output)
 
-    protocols: List[str] = []
-    invalid: List[str] = []
-    for part in raw_parts:
-        normalized = normalize_scheme(part)
-        if normalized is None:
-            invalid.append(part)
-            continue
-        protocols.append(normalized)
-
-    if invalid:
-        fail(f"invalid protocols: {', '.join(invalid)}")
-    return tuple(protocols)
-
-
-def print_summary(
-    output_path: str,
-    wanted: int,
-    saved: int,
-    tested: int,
-    total_candidates: int,
-    workers: int,
-    elapsed_seconds: float,
-    baseline_ip: Optional[str],
-) -> None:
     print(
-        f"Saved {saved}/{wanted} working proxies to: {os.path.abspath(output_path)}",
+        f"Saved {paint(str(found), Ansi.GREEN)} working proxies to: {abs_out}",
         file=sys.stderr,
     )
     print(
-        f"Tested candidates: {tested}/{total_candidates} | workers={workers} | elapsed={elapsed_seconds:.2f}s",
+        f"tested={tested:,} | workers={args.workers} | timeout={args.timeout}s | elapsed={elapsed:.2f}s",
         file=sys.stderr,
     )
     if baseline_ip:
-        print(f"Direct public IP: {baseline_ip}", file=sys.stderr)
+        print(f"baseline_ip={baseline_ip}", file=sys.stderr)
+    return 0
 
 
 def main() -> int:
-    args = parser().parse_args()
+    if not _python_version_ok():
+        print("ERROR: Please run with Python 3.8+.", file=sys.stderr)
+        return 2
+
+    parser = build_parser()
+    args = parser.parse_args()
 
     if args.list_sources:
-        print_sources()
+        list_sources()
         return 0
 
-    need_count = max(1, int(args.need)) if args.need and args.need > 0 else prompt_need_count(DEFAULT_NEED)
-    protocols = validate_protocol_list(args.protocols)
-    ensure_requests()
-    ensure_socks_if_needed(protocols)
+    if args.need <= 0:
+        args.need = prompt_for_need(DEFAULT_NEED)
 
-    workers = max(1, int(args.workers)) if args.workers and args.workers > 0 else default_workers(need_count)
-    max_pending = max(workers + 64, workers * 2)
-    retries = max(1, int(args.retries))
-    max_per_source = max(0, int(args.max_per_source))
-    global_limit = max(0, int(args.limit))
+    args.workers = max(1, int(args.workers))
+    args.timeout = max(0.5, float(args.timeout))
+    args.source_workers = max(1, int(args.source_workers))
+    args.per_source_limit = int(args.per_source_limit)
+    if args.per_source_limit <= 0:
+        args.per_source_limit = auto_per_source_limit(args.need)
 
-    configure_session_pool(workers)
-
-    sources = selected_sources(args.source or None)
-    probe_urls = tuple(args.probe_url) if args.probe_url else DEFAULT_PROBE_URLS
-    target_urls = tuple(args.target_url) if args.target_url else DEFAULT_TARGET_URLS
-
-    baseline_ip = None
-    if args.require_ip_change:
-        baseline_ip = detect_public_ip(args.connect_timeout, args.read_timeout)
-        if baseline_ip is None:
-            fail("failed to detect the direct public IP, cannot enforce --require-ip-change.", exit_code=1)
-
-    settings = Settings(
-        need_count=need_count,
-        workers=workers,
-        max_pending=max_pending,
-        connect_timeout=args.connect_timeout,
-        read_timeout=args.read_timeout,
-        retries=retries,
-        protocols=protocols,
-        verify_protocol=bool(args.verify_protocol),
-        allow_multi_scheme=bool(args.allow_multi_scheme),
-        probe_urls=probe_urls,
-        target_urls=target_urls,
-        target_mode=args.target_mode,
-        skip_target_check=bool(args.skip_target_check),
-        require_ip_change=bool(args.require_ip_change),
-        baseline_ip=baseline_ip,
-    )
-
-    started_at = time.time()
-    candidates, source_stats = fetch_candidates(
-        sources=sources,
-        connect_timeout=settings.connect_timeout,
-        read_timeout=settings.read_timeout,
-        retries=settings.retries,
-        max_per_source=max_per_source,
-        global_limit=global_limit,
-        verbose=args.verbose,
-    )
-
-    if not candidates:
-        fail("no proxy candidates were fetched from the selected sources.", exit_code=1)
-
-    downloaded_sources = sum(1 for stat in source_stats.values() if stat.get("downloaded"))
-    if args.verbose:
-        print(
-            f"Sources loaded: {downloaded_sources}/{len(source_stats)} | queued endpoints: {len(candidates)}",
-            file=sys.stderr,
-        )
-
-    stop_event = threading.Event()
-    working: List[WorkingProxy] = []
-    seen_proxy_urls: Set[str] = set()
-    tested = 0
-    last_progress = 0.0
-
-    with cf.ThreadPoolExecutor(max_workers=settings.workers) as executor:
-        for item in iter_completed(executor, candidates, settings, stop_event):
-            tested += 1
-            for result in item.results:
-                proxy_url = item.candidate.proxy_url(result.scheme)
-                if proxy_url in seen_proxy_urls:
-                    continue
-                seen_proxy_urls.add(proxy_url)
-                working.append(
-                    WorkingProxy(
-                        proxy_url=proxy_url,
-                        scheme=result.scheme,
-                        latency_ms=result.latency_ms,
-                        endpoint=item.candidate.endpoint,
-                        exit_ip=result.exit_ip,
-                        source_count=len(item.candidate.sources),
-                    )
-                )
-
-            if len(working) >= settings.need_count and not stop_event.is_set():
-                stop_event.set()
-                print(
-                    f"Reached target: {len(working)} working proxies. Finishing queued tests...",
-                    file=sys.stderr,
-                )
-
-            now = time.time()
-            if tested == len(candidates) or (now - last_progress) >= 1.0:
-                print(
-                    f"Tested {tested}/{len(candidates)} | working={len(working)} | pending_limit={settings.max_pending}",
-                    file=sys.stderr,
-                )
-                last_progress = now
-
-    working.sort(key=lambda item: (item.latency_ms, -item.source_count, item.proxy_url))
-    selected = working[: settings.need_count]
-    write_output(args.output, selected)
-
-    print_summary(
-        output_path=args.output,
-        wanted=settings.need_count,
-        saved=len(selected),
-        tested=tested,
-        total_candidates=len(candidates),
-        workers=settings.workers,
-        elapsed_seconds=time.time() - started_at,
-        baseline_ip=baseline_ip,
-    )
-
-    if len(selected) < settings.need_count:
-        print(
-            "Warning: fewer working proxies were found than requested. "
-            "Try increasing --limit, lowering timeouts, or disabling strict filters.",
-            file=sys.stderr,
-        )
-    return 0
+    try:
+        return asyncio.run(async_main(args))
+    except KeyboardInterrupt:
+        print("\nInterrupted. Saved results remain in the output file.", file=sys.stderr)
+        return 130
 
 
 if __name__ == "__main__":
