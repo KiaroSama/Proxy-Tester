@@ -891,10 +891,10 @@ async def fetch_all_sources(args) -> Tuple[List[ProxyCandidate], List[SourceResu
         results.append(result)
         ordered_lists.append(candidates)
 
-    merged: Dict[Tuple[str, str, int, Optional[str], Optional[str]], ProxyCandidate] = {}
+    merged: Dict[str, ProxyCandidate] = {}
     for candidates in ordered_lists:
         for candidate in candidates:
-            merged.setdefault(candidate.key, candidate)
+            merged.setdefault(candidate.proxy_url, candidate)
 
     return list(merged.values()), results
 
@@ -903,11 +903,13 @@ class ResultWriter:
     def __init__(self, path: str):
         self.path = path
         self.handle = None
+        self.written = set()
 
     def __enter__(self):
         output_path = Path(self.path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text("", encoding="utf-8")
+        self.written.clear()
         self.handle = output_path.open("a", encoding="utf-8", buffering=1, newline="\n")
         return self
 
@@ -915,15 +917,19 @@ class ResultWriter:
         if self.handle is not None:
             self.handle.close()
 
-    def write_line(self, line: str) -> None:
+    def write_line(self, line: str) -> bool:
         if self.handle is None:
             raise RuntimeError("Writer is not open.")
+        if line in self.written:
+            return False
+        self.written.add(line)
         self.handle.write(line + "\n")
         self.handle.flush()
         try:
             os.fsync(self.handle.fileno())
         except Exception:
             pass
+        return True
 
 
 class SharedState:
@@ -933,6 +939,7 @@ class SharedState:
         self.found = 0
         self.next_index = 0
         self.seen_working = set()
+        self.seen_tested = set()
         self.stop_event = asyncio.Event()
         self.index_lock = asyncio.Lock()
         self.result_lock = asyncio.Lock()
@@ -999,23 +1006,22 @@ async def test_candidate(http_session, ProxyConnector, aiohttp, candidate: Proxy
     return True
 
 
-def status_line(tested: int, total: int, found: int, need: int, workers: int) -> str:
+def status_line(tested: int, total: int, found: int, need: int) -> str:
     tested_text = paint(f"Tested {tested}/{total}", Ansi.CYAN)
     working_text = paint(f"working={found}", Ansi.GREEN if found > 0 else Ansi.DIM)
     need_text = paint(f"need={need}", Ansi.YELLOW)
-    workers_text = paint(f"concurrency={workers}", Ansi.MAGENTA)
-    return f"{tested_text} | {working_text} | {need_text} | {workers_text}"
+    return f"{tested_text} | {working_text} | {need_text}"
 
 
 async def progress_loop(state: SharedState, total: int, workers: int) -> None:
     while not state.stop_event.is_set():
         async with state.result_lock:
-            line = status_line(state.tested, total, state.found, state.need, workers)
+            line = status_line(state.tested, total, state.found, state.need)
         print("\r" + line + " " * 10, end="", file=sys.stderr, flush=True)
         await asyncio.sleep(0.35)
 
     async with state.result_lock:
-        line = status_line(state.tested, total, state.found, state.need, workers)
+        line = status_line(state.tested, total, state.found, state.need)
     print("\r" + line + " " * 10, file=sys.stderr, flush=True)
 
 
@@ -1037,21 +1043,30 @@ async def worker_loop(
             state.next_index += 1
 
         candidate = candidates[index]
+        proxy_url = candidate.proxy_url
+
+        async with state.result_lock:
+            if proxy_url in state.seen_tested:
+                continue
+            state.seen_tested.add(proxy_url)
+
         ok = await test_candidate(http_session, ProxyConnector, aiohttp, candidate, args, baseline_ip)
 
         async with state.result_lock:
             state.tested += 1
             if not ok:
                 continue
-            proxy_url = candidate.proxy_url
             if proxy_url in state.seen_working:
                 continue
             if state.found >= state.need:
                 state.stop_event.set()
                 return
+            wrote = writer.write_line(proxy_url)
+            if not wrote:
+                state.seen_working.add(proxy_url)
+                continue
             state.seen_working.add(proxy_url)
             state.found += 1
-            writer.write_line(proxy_url)
             if state.found >= state.need:
                 state.stop_event.set()
                 return
