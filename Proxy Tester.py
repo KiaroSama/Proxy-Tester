@@ -99,6 +99,40 @@ class Ansi:
 USE_COLOR = sys.stderr.isatty() and not os.environ.get("NO_COLOR")
 
 
+def _connector_cleanup_closed_enabled() -> bool:
+    return os.name != "nt"
+
+
+def _is_benign_windows_proactor_reset(context: dict) -> bool:
+    if os.name != "nt":
+        return False
+    exc = context.get("exception")
+    if not isinstance(exc, ConnectionResetError):
+        return False
+    if getattr(exc, "winerror", None) != 10054:
+        return False
+    message = str(context.get("message") or "")
+    handle = context.get("handle")
+    handle_repr = repr(handle) if handle is not None else ""
+    probe = f"{message} {handle_repr}"
+    return "_ProactorBasePipeTransport._call_connection_lost" in probe
+
+
+def install_asyncio_exception_filter() -> None:
+    loop = asyncio.get_running_loop()
+    previous_handler = loop.get_exception_handler()
+
+    def handler(loop_obj, context):
+        if _is_benign_windows_proactor_reset(context):
+            return
+        if previous_handler is not None:
+            previous_handler(loop_obj, context)
+        else:
+            loop_obj.default_exception_handler(context)
+
+    loop.set_exception_handler(handler)
+
+
 def paint(text: str, code: str) -> str:
     if not USE_COLOR:
         return text
@@ -830,7 +864,7 @@ async def fetch_all_sources(args) -> Tuple[List[ProxyCandidate], List[SourceResu
     aiohttp, _ = ensure_runtime_deps()
     headers = {"User-Agent": USER_AGENT}
     timeout = aiohttp.ClientTimeout(total=max(5.0, args.source_timeout))
-    connector = aiohttp.TCPConnector(limit=0, ttl_dns_cache=300, enable_cleanup_closed=True)
+    connector = aiohttp.TCPConnector(limit=0, ttl_dns_cache=300, enable_cleanup_closed=_connector_cleanup_closed_enabled())
     semaphore = asyncio.Semaphore(max(1, args.source_workers))
 
     async def bounded_fetch(session, source: SourceSpec):
@@ -1030,7 +1064,7 @@ async def run_checks(candidates: Sequence[ProxyCandidate], args) -> Tuple[int, i
     maybe_raise_nofile_limit(args.workers)
 
     timeout = aiohttp.ClientTimeout(total=max(0.5, args.timeout))
-    connector = aiohttp.TCPConnector(limit=0, ttl_dns_cache=300, enable_cleanup_closed=True)
+    connector = aiohttp.TCPConnector(limit=0, ttl_dns_cache=300, enable_cleanup_closed=_connector_cleanup_closed_enabled())
     headers = {"User-Agent": USER_AGENT}
     state = SharedState(need=args.need)
 
@@ -1192,6 +1226,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 async def async_main(args) -> int:
+    install_asyncio_exception_filter()
     candidates, source_results = await fetch_all_sources(args)
     if not candidates:
         print(paint("ERROR: no candidates fetched from any source.", Ansi.RED), file=sys.stderr)
