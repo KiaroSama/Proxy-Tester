@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
-Fetch public proxies from multiple GitHub sources, test them on the current
+Fetch public proxies from curated public sources, test them on the current
 machine/network, and write working proxies to a single text file immediately.
 
 Highlights:
 - asks how many working proxies you need (default: 50)
-- checks/install runtime dependencies only when missing
+- installs runtime dependencies only when missing
 - uses high async concurrency for faster testing
 - saves each working proxy as soon as it is found
 - stops exactly at the requested number of saved proxies
+- prefers high-confidence, actively maintained proxy sources
 - prints colorized progress in the terminal
 """
 
@@ -21,46 +22,72 @@ import ipaddress
 import json
 import os
 import re
+import ssl
 import subprocess
 import sys
 import time
+from collections import defaultdict, deque
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Deque, Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import quote, urlsplit
 
 
-USER_AGENT = "proxy-tester/5.0"
+# Basic runtime defaults.
+USER_AGENT = "proxy-tester/6.0"
 DEFAULT_NEED = 50
-DEFAULT_WORKERS = 1000
-DEFAULT_TIMEOUT = 3.0
-DEFAULT_SOURCE_TIMEOUT = 20.0
-DEFAULT_SOURCE_WORKERS = 24
+DEFAULT_TIMEOUT = 2.5
+DEFAULT_SOURCE_TIMEOUT = 15.0
+DEFAULT_SOURCE_WORKERS = 12
 DEFAULT_PER_SOURCE_LIMIT = 0
-DEFAULT_TEST_URL = "https://ec.europa.eu/taxation_customs/vies/"
+DEFAULT_SOURCE_BATCH_SIZE = 6
+DEFAULT_CANDIDATE_MULTIPLIER = 60
+DEFAULT_TEST_URLS: Tuple[str, ...] = (
+    "https://www.gstatic.com/generate_204",
+    "https://cp.cloudflare.com/generate_204",
+)
 DEFAULT_IP_URL = "https://api.ipify.org?format=json"
+SCHEME_ORDER: Tuple[str, ...] = ("http", "socks5", "socks4")
 TOKEN_SPLIT_RE = re.compile(r"[\s,;]+")
-IPV4_EXTRACT_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+IPV4_LIKE_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
 HOSTNAME_RE = re.compile(
     r"^(?=.{1,253}$)(?!-)(?:[A-Za-z0-9-]{1,63}\.)*[A-Za-z0-9-]{1,63}$"
 )
 
 
+def default_worker_count() -> int:
+    """Pick a balanced async worker count for typical desktop/server machines."""
+    cpu = os.cpu_count() or 4
+    return max(250, min(1200, cpu * 160))
+
+
+DEFAULT_WORKERS = default_worker_count()
+
+
 @dataclass(frozen=True)
 class SourceSpec:
+    """Describe one proxy source and how much we trust or prefer it."""
+
     name: str
     urls: Tuple[str, ...]
-    scheme_hint: Optional[str] = None
+    scheme_hint: str
+    priority: int = 50
     max_items: int = 0
+    min_items: int = 1
 
 
 @dataclass(frozen=True)
 class ProxyCandidate:
+    """Represent one proxy candidate plus some lightweight source metadata."""
+
     scheme: str
     host: str
     port: int
     username: Optional[str] = None
     password: Optional[str] = None
+    source_name: str = ""
+    source_priority: int = 100
 
     @property
     def key(self) -> Tuple[str, str, int, Optional[str], Optional[str]]:
@@ -77,14 +104,30 @@ class ProxyCandidate:
         return f"{self.scheme}://{auth}{format_host(self.host)}:{self.port}"
 
 
+@dataclass(frozen=True)
+class ProbeTarget:
+    """Store parsed URL parts once so workers do not re-parse for every proxy."""
+
+    raw_url: str
+    scheme: str
+    host: str
+    port: int
+    path_qs: str
+
+
 @dataclass
 class SourceResult:
+    """Keep a short fetch summary for one source."""
+
     source: SourceSpec
     count: int
+    url_used: Optional[str] = None
     error: Optional[str] = None
 
 
 class Ansi:
+    """Small ANSI color helper used only for terminal status output."""
+
     RESET = "\033[0m"
     BOLD = "\033[1m"
     DIM = "\033[2m"
@@ -99,10 +142,12 @@ class Ansi:
 USE_COLOR = sys.stderr.isatty() and not os.environ.get("NO_COLOR")
 
 
+# Keep the Windows event loop quieter for harmless reset noise.
 def _connector_cleanup_closed_enabled() -> bool:
     return os.name != "nt"
 
 
+# Ignore a well-known benign Windows transport reset warning.
 def _is_benign_windows_proactor_reset(context: dict) -> bool:
     if os.name != "nt":
         return False
@@ -118,6 +163,7 @@ def _is_benign_windows_proactor_reset(context: dict) -> bool:
     return "_ProactorBasePipeTransport._call_connection_lost" in probe
 
 
+# Install the Windows-specific exception filter once per event loop.
 def install_asyncio_exception_filter() -> None:
     loop = asyncio.get_running_loop()
     previous_handler = loop.get_exception_handler()
@@ -133,13 +179,16 @@ def install_asyncio_exception_filter() -> None:
     loop.set_exception_handler(handler)
 
 
+# Paint terminal text only when color is supported.
 def paint(text: str, code: str) -> str:
     if not USE_COLOR:
         return text
     return f"{code}{text}{Ansi.RESET}"
 
 
+# Curated active sources, grouped by confidence and freshness.
 SOURCES: Tuple[SourceSpec, ...] = (
+    # Highest-confidence sources with explicit validation/update claims.
     SourceSpec(
         name="proxifly_http",
         urls=(
@@ -147,7 +196,8 @@ SOURCES: Tuple[SourceSpec, ...] = (
             "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/http/data.txt",
         ),
         scheme_hint="http",
-        max_items=6000,
+        priority=10,
+        max_items=4000,
     ),
     SourceSpec(
         name="proxifly_https",
@@ -156,16 +206,8 @@ SOURCES: Tuple[SourceSpec, ...] = (
             "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/https/data.txt",
         ),
         scheme_hint="http",
-        max_items=5000,
-    ),
-    SourceSpec(
-        name="proxifly_all",
-        urls=(
-            "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/all/data.txt",
-            "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/all/data.txt",
-        ),
-        scheme_hint=None,
-        max_items=9000,
+        priority=10,
+        max_items=3000,
     ),
     SourceSpec(
         name="proxifly_socks4",
@@ -174,7 +216,8 @@ SOURCES: Tuple[SourceSpec, ...] = (
             "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/socks4/data.txt",
         ),
         scheme_hint="socks4",
-        max_items=5000,
+        priority=10,
+        max_items=2500,
     ),
     SourceSpec(
         name="proxifly_socks5",
@@ -183,7 +226,8 @@ SOURCES: Tuple[SourceSpec, ...] = (
             "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/socks5/data.txt",
         ),
         scheme_hint="socks5",
-        max_items=5000,
+        priority=10,
+        max_items=2500,
     ),
     SourceSpec(
         name="monosans_http",
@@ -191,7 +235,8 @@ SOURCES: Tuple[SourceSpec, ...] = (
             "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
         ),
         scheme_hint="http",
-        max_items=6000,
+        priority=10,
+        max_items=2500,
     ),
     SourceSpec(
         name="monosans_socks4",
@@ -199,7 +244,8 @@ SOURCES: Tuple[SourceSpec, ...] = (
             "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks4.txt",
         ),
         scheme_hint="socks4",
-        max_items=5000,
+        priority=10,
+        max_items=1800,
     ),
     SourceSpec(
         name="monosans_socks5",
@@ -207,39 +253,8 @@ SOURCES: Tuple[SourceSpec, ...] = (
             "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt",
         ),
         scheme_hint="socks5",
-        max_items=5000,
-    ),
-    SourceSpec(
-        name="roosterkid_http",
-        urls=(
-            "https://raw.githubusercontent.com/roosterkid/openproxylist/main/HTTPS_RAW.txt",
-        ),
-        scheme_hint="http",
-        max_items=5000,
-    ),
-    SourceSpec(
-        name="roosterkid_socks4",
-        urls=(
-            "https://raw.githubusercontent.com/roosterkid/openproxylist/main/SOCKS4_RAW.txt",
-        ),
-        scheme_hint="socks4",
-        max_items=5000,
-    ),
-    SourceSpec(
-        name="roosterkid_socks5",
-        urls=(
-            "https://raw.githubusercontent.com/roosterkid/openproxylist/main/SOCKS5_RAW.txt",
-        ),
-        scheme_hint="socks5",
-        max_items=5000,
-    ),
-    SourceSpec(
-        name="iplocate_all",
-        urls=(
-            "https://raw.githubusercontent.com/iplocate/free-proxy-list/main/all-proxies.txt",
-        ),
-        scheme_hint=None,
-        max_items=9000,
+        priority=10,
+        max_items=1800,
     ),
     SourceSpec(
         name="iplocate_http",
@@ -247,7 +262,8 @@ SOURCES: Tuple[SourceSpec, ...] = (
             "https://raw.githubusercontent.com/iplocate/free-proxy-list/main/protocols/http.txt",
         ),
         scheme_hint="http",
-        max_items=6000,
+        priority=11,
+        max_items=2500,
     ),
     SourceSpec(
         name="iplocate_https",
@@ -255,7 +271,8 @@ SOURCES: Tuple[SourceSpec, ...] = (
             "https://raw.githubusercontent.com/iplocate/free-proxy-list/main/protocols/https.txt",
         ),
         scheme_hint="http",
-        max_items=5000,
+        priority=11,
+        max_items=2200,
     ),
     SourceSpec(
         name="iplocate_socks4",
@@ -263,7 +280,8 @@ SOURCES: Tuple[SourceSpec, ...] = (
             "https://raw.githubusercontent.com/iplocate/free-proxy-list/main/protocols/socks4.txt",
         ),
         scheme_hint="socks4",
-        max_items=5000,
+        priority=11,
+        max_items=1800,
     ),
     SourceSpec(
         name="iplocate_socks5",
@@ -271,342 +289,265 @@ SOURCES: Tuple[SourceSpec, ...] = (
             "https://raw.githubusercontent.com/iplocate/free-proxy-list/main/protocols/socks5.txt",
         ),
         scheme_hint="socks5",
-        max_items=5000,
-    ),
-    SourceSpec(
-        name="speedx_http",
-        urls=(
-            "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
-            "https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/http.txt",
-        ),
-        scheme_hint="http",
-        max_items=5000,
-    ),
-    SourceSpec(
-        name="speedx_socks4",
-        urls=(
-            "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks4.txt",
-            "https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/socks4.txt",
-        ),
-        scheme_hint="socks4",
-        max_items=5000,
-    ),
-    SourceSpec(
-        name="speedx_socks5",
-        urls=(
-            "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt",
-            "https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/socks5.txt",
-        ),
-        scheme_hint="socks5",
-        max_items=5000,
-    ),
-    SourceSpec(
-        name="zaeem_http",
-        urls=(
-            "https://raw.githubusercontent.com/Zaeem20/FREE_PROXIES_LIST/master/http.txt",
-            "https://raw.githubusercontent.com/Zaeem20/FREE_PROXIES_LIST/master/https.txt",
-        ),
-        scheme_hint="http",
-        max_items=6000,
-    ),
-    SourceSpec(
-        name="zaeem_socks4",
-        urls=(
-            "https://raw.githubusercontent.com/Zaeem20/FREE_PROXIES_LIST/master/socks4.txt",
-        ),
-        scheme_hint="socks4",
-        max_items=5000,
-    ),
-    SourceSpec(
-        name="zaeem_socks5",
-        urls=(
-            "https://raw.githubusercontent.com/Zaeem20/FREE_PROXIES_LIST/master/socks5.txt",
-        ),
-        scheme_hint="socks5",
-        max_items=5000,
+        priority=11,
+        max_items=1800,
     ),
     SourceSpec(
         name="vakhov_http",
         urls=(
             "https://vakhov.github.io/fresh-proxy-list/http.txt",
-            "https://vakhov.github.io/fresh-proxy-list/https.txt",
+            "https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/http.txt",
         ),
         scheme_hint="http",
-        max_items=6000,
+        priority=12,
+        max_items=2500,
     ),
     SourceSpec(
         name="vakhov_socks4",
         urls=(
             "https://vakhov.github.io/fresh-proxy-list/socks4.txt",
+            "https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/socks4.txt",
         ),
         scheme_hint="socks4",
-        max_items=5000,
+        priority=12,
+        max_items=1800,
     ),
     SourceSpec(
         name="vakhov_socks5",
         urls=(
             "https://vakhov.github.io/fresh-proxy-list/socks5.txt",
+            "https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/socks5.txt",
         ),
         scheme_hint="socks5",
-        max_items=5000,
+        priority=12,
+        max_items=1800,
     ),
     SourceSpec(
         name="fyvri_http",
         urls=(
-            "https://raw.githubusercontent.com/fyvri/fresh-proxy-list/main/http.txt",
-            "https://raw.githubusercontent.com/fyvri/fresh-proxy-list/main/https.txt",
+            "https://raw.githubusercontent.com/fyvri/fresh-proxy-list/archive/storage/classic/http.txt",
         ),
         scheme_hint="http",
-        max_items=6000,
+        priority=13,
+        max_items=2200,
     ),
     SourceSpec(
         name="fyvri_socks4",
         urls=(
-            "https://raw.githubusercontent.com/fyvri/fresh-proxy-list/main/socks4.txt",
+            "https://raw.githubusercontent.com/fyvri/fresh-proxy-list/archive/storage/classic/socks4.txt",
         ),
         scheme_hint="socks4",
-        max_items=5000,
+        priority=13,
+        max_items=1600,
     ),
     SourceSpec(
         name="fyvri_socks5",
         urls=(
-            "https://raw.githubusercontent.com/fyvri/fresh-proxy-list/main/socks5.txt",
+            "https://raw.githubusercontent.com/fyvri/fresh-proxy-list/archive/storage/classic/socks5.txt",
         ),
         scheme_hint="socks5",
-        max_items=5000,
+        priority=13,
+        max_items=1600,
     ),
     SourceSpec(
-        name="dpangestuw_http",
+        name="roosterkid_http",
         urls=(
-            "https://raw.githubusercontent.com/dpangestuw/Free-Proxy/refs/heads/main/http_proxies.txt",
+            "https://raw.githubusercontent.com/roosterkid/openproxylist/main/HTTPS_RAW.txt",
         ),
         scheme_hint="http",
-        max_items=6000,
+        priority=14,
+        max_items=2200,
     ),
     SourceSpec(
-        name="dpangestuw_socks4",
+        name="roosterkid_socks4",
         urls=(
-            "https://raw.githubusercontent.com/dpangestuw/Free-Proxy/refs/heads/main/socks4_proxies.txt",
+            "https://raw.githubusercontent.com/roosterkid/openproxylist/main/SOCKS4_RAW.txt",
         ),
         scheme_hint="socks4",
-        max_items=5000,
+        priority=14,
+        max_items=1600,
     ),
     SourceSpec(
-        name="dpangestuw_socks5",
+        name="roosterkid_socks5",
         urls=(
-            "https://raw.githubusercontent.com/dpangestuw/Free-Proxy/refs/heads/main/socks5_proxies.txt",
+            "https://raw.githubusercontent.com/roosterkid/openproxylist/main/SOCKS5_RAW.txt",
         ),
         scheme_hint="socks5",
-        max_items=5000,
+        priority=14,
+        max_items=1600,
     ),
+    # Secondary active sources used as additional coverage.
     SourceSpec(
-        name="dpangestuw_all",
+        name="r00tee_http",
         urls=(
-            "https://raw.githubusercontent.com/dpangestuw/Free-Proxy/refs/heads/main/allive.txt",
-        ),
-        scheme_hint=None,
-        max_items=9000,
-    ),
-    SourceSpec(
-        name="joy_http",
-        urls=(
-            "https://raw.githubusercontent.com/thenasty1337/free-proxy-list/main/data/latest/types/http/proxies.txt",
+            "https://raw.githubusercontent.com/r00tee/Proxy-List/main/Https.txt",
         ),
         scheme_hint="http",
-        max_items=6000,
+        priority=20,
+        max_items=2500,
     ),
     SourceSpec(
-        name="joy_socks4",
+        name="r00tee_socks4",
         urls=(
-            "https://raw.githubusercontent.com/thenasty1337/free-proxy-list/main/data/latest/types/socks4/proxies.txt",
+            "https://raw.githubusercontent.com/r00tee/Proxy-List/main/Socks4.txt",
         ),
         scheme_hint="socks4",
-        max_items=5000,
+        priority=20,
+        max_items=1800,
     ),
     SourceSpec(
-        name="joy_socks5",
+        name="r00tee_socks5",
         urls=(
-            "https://raw.githubusercontent.com/thenasty1337/free-proxy-list/main/data/latest/types/socks5/proxies.txt",
+            "https://raw.githubusercontent.com/r00tee/Proxy-List/main/Socks5.txt",
         ),
         scheme_hint="socks5",
-        max_items=5000,
+        priority=20,
+        max_items=1800,
     ),
     SourceSpec(
-        name="joy_all",
+        name="clearproxy_http",
         urls=(
-            "https://raw.githubusercontent.com/thenasty1337/free-proxy-list/main/data/latest/proxies.txt",
-        ),
-        scheme_hint=None,
-        max_items=9000,
-    ),
-    SourceSpec(
-        name="kangproxy_raw",
-        urls=(
-            "https://raw.githubusercontent.com/officialputuid/KangProxy/KangProxy/xResults/RAW.txt",
-        ),
-        scheme_hint=None,
-        max_items=7000,
-    ),
-    SourceSpec(
-        name="kangproxy_http",
-        urls=(
-            "https://raw.githubusercontent.com/officialputuid/KangProxy/KangProxy/http/http.txt",
+            "https://raw.githubusercontent.com/ClearProxy/checked-proxy-list/main/http/raw/all.txt",
         ),
         scheme_hint="http",
-        max_items=6000,
+        priority=21,
+        max_items=2500,
     ),
     SourceSpec(
-        name="kangproxy_https",
+        name="clearproxy_socks4",
         urls=(
-            "https://raw.githubusercontent.com/officialputuid/KangProxy/KangProxy/https/https.txt",
-        ),
-        scheme_hint="http",
-        max_items=5000,
-    ),
-    SourceSpec(
-        name="kangproxy_socks4",
-        urls=(
-            "https://raw.githubusercontent.com/officialputuid/KangProxy/KangProxy/socks4/socks4.txt",
+            "https://raw.githubusercontent.com/ClearProxy/checked-proxy-list/main/socks4/raw/all.txt",
         ),
         scheme_hint="socks4",
-        max_items=5000,
+        priority=21,
+        max_items=1800,
     ),
     SourceSpec(
-        name="kangproxy_socks5",
+        name="clearproxy_socks5",
         urls=(
-            "https://raw.githubusercontent.com/officialputuid/KangProxy/KangProxy/socks5/socks5.txt",
+            "https://raw.githubusercontent.com/ClearProxy/checked-proxy-list/main/socks5/raw/all.txt",
         ),
         scheme_hint="socks5",
-        max_items=5000,
+        priority=21,
+        max_items=1800,
     ),
     SourceSpec(
-        name="kangproxy_all",
+        name="vann_http",
         urls=(
-            "https://raw.githubusercontent.com/officialputuid/KangProxy/KangProxy/xResults/Proxies.txt",
-        ),
-        scheme_hint=None,
-        max_items=9000,
-    ),
-    SourceSpec(
-        name="gfp_http",
-        urls=(
-            "https://raw.githubusercontent.com/wiki/gfpcom/free-proxy-list/lists/http.txt",
+            "https://raw.githubusercontent.com/Vann-Dev/proxy-list/main/proxies/http.txt",
         ),
         scheme_hint="http",
-        max_items=8000,
+        priority=22,
+        max_items=1800,
     ),
     SourceSpec(
-        name="gfp_socks4",
+        name="vann_socks4",
         urls=(
-            "https://raw.githubusercontent.com/wiki/gfpcom/free-proxy-list/lists/socks4.txt",
+            "https://raw.githubusercontent.com/Vann-Dev/proxy-list/main/proxies/socks4.txt",
         ),
         scheme_hint="socks4",
-        max_items=8000,
+        priority=22,
+        max_items=1200,
     ),
     SourceSpec(
-        name="gfp_socks5",
+        name="ercin_http",
         urls=(
-            "https://raw.githubusercontent.com/wiki/gfpcom/free-proxy-list/lists/socks5.txt",
-        ),
-        scheme_hint="socks5",
-        max_items=8000,
-    ),
-    SourceSpec(
-        name="clarketm_http",
-        urls=(
-            "https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt",
+            "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/http.txt",
         ),
         scheme_hint="http",
-        max_items=4000,
+        priority=23,
+        max_items=1800,
     ),
     SourceSpec(
-        name="aliilapro_http",
+        name="ercin_socks4",
         urls=(
-            "https://raw.githubusercontent.com/ALIILAPRO/Proxy/main/http.txt",
-        ),
-        scheme_hint="http",
-        max_items=5000,
-    ),
-    SourceSpec(
-        name="aliilapro_socks4",
-        urls=(
-            "https://raw.githubusercontent.com/ALIILAPRO/Proxy/main/socks4.txt",
+            "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/socks4.txt",
         ),
         scheme_hint="socks4",
-        max_items=5000,
+        priority=23,
+        max_items=1200,
     ),
     SourceSpec(
-        name="aliilapro_socks5",
+        name="ercin_socks5",
         urls=(
-            "https://raw.githubusercontent.com/ALIILAPRO/Proxy/main/socks5.txt",
+            "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/socks5.txt",
         ),
         scheme_hint="socks5",
-        max_items=5000,
+        priority=23,
+        max_items=1200,
     ),
     SourceSpec(
-        name="themiralay_http",
+        name="proxyscraper_http",
         urls=(
-            "https://raw.githubusercontent.com/themiralay/Proxy-List-World/master/data.txt",
+            "https://raw.githubusercontent.com/ProxyScraper/ProxyScraper/main/http.txt",
         ),
         scheme_hint="http",
-        max_items=1000,
+        priority=24,
+        max_items=1800,
     ),
     SourceSpec(
-        name="firmfox_http",
+        name="proxyscraper_socks4",
         urls=(
-            "https://raw.githubusercontent.com/Firmfox/proxify/main/proxies/http.txt",
-        ),
-        scheme_hint="http",
-        max_items=5000,
-    ),
-    SourceSpec(
-        name="firmfox_https",
-        urls=(
-            "https://raw.githubusercontent.com/Firmfox/proxify/main/proxies/https.txt",
-        ),
-        scheme_hint="http",
-        max_items=5000,
-    ),
-    SourceSpec(
-        name="firmfox_socks4",
-        urls=(
-            "https://raw.githubusercontent.com/Firmfox/proxify/main/proxies/socks4.txt",
+            "https://raw.githubusercontent.com/ProxyScraper/ProxyScraper/main/socks4.txt",
         ),
         scheme_hint="socks4",
-        max_items=5000,
+        priority=24,
+        max_items=1200,
     ),
     SourceSpec(
-        name="firmfox_socks5",
+        name="proxyscraper_socks5",
         urls=(
-            "https://raw.githubusercontent.com/Firmfox/proxify/main/proxies/socks5.txt",
+            "https://raw.githubusercontent.com/ProxyScraper/ProxyScraper/main/socks5.txt",
         ),
         scheme_hint="socks5",
-        max_items=5000,
+        priority=24,
+        max_items=1200,
     ),
     SourceSpec(
-        name="mishakorzik_http",
+        name="thespeedx_http",
         urls=(
-            "https://raw.githubusercontent.com/mishakorzik/Free-Proxy/main/proxy.txt",
-            "https://raw.githubusercontent.com/mishakorzik/Free-Proxy/main/packages/Proxy.txt",
+            "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
         ),
         scheme_hint="http",
-        max_items=4000,
+        priority=25,
+        max_items=1800,
     ),
     SourceSpec(
-        name="loneking_all",
+        name="thespeedx_socks4",
         urls=(
-            "https://raw.githubusercontent.com/LoneKingCode/free-proxy-db/refs/heads/main/proxies/all.txt",
+            "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks4.txt",
         ),
-        scheme_hint=None,
-        max_items=9000,
+        scheme_hint="socks4",
+        priority=25,
+        max_items=1200,
+    ),
+    SourceSpec(
+        name="thespeedx_socks5",
+        urls=(
+            "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt",
+        ),
+        scheme_hint="socks5",
+        priority=25,
+        max_items=1200,
+    ),
+    SourceSpec(
+        name="hookzof_socks5",
+        urls=(
+            "https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt",
+        ),
+        scheme_hint="socks5",
+        priority=26,
+        max_items=1200,
     ),
 )
 
 
+# Make sure the current interpreter is new enough for asyncio features we use.
 def _python_version_ok() -> bool:
     return sys.version_info >= (3, 8)
 
 
+# Try a normal install first, then a user install as fallback.
 def _try_install(package: str) -> bool:
     commands = (
         [
@@ -638,6 +579,7 @@ def _try_install(package: str) -> bool:
     return False
 
 
+# Import a dependency and auto-install it only when needed.
 def _import_or_install(import_name: str, package_name: Optional[str] = None):
     try:
         return importlib.import_module(import_name)
@@ -649,12 +591,14 @@ def _import_or_install(import_name: str, package_name: Optional[str] = None):
         return importlib.import_module(import_name)
 
 
+# Load all runtime network dependencies once.
 def ensure_runtime_deps():
     aiohttp = _import_or_install("aiohttp")
-    aiohttp_socks = _import_or_install("aiohttp_socks", "aiohttp-socks")
-    return aiohttp, aiohttp_socks
+    python_socks_asyncio = _import_or_install("python_socks.async_.asyncio", "python-socks")
+    return aiohttp, python_socks_asyncio
 
 
+# Raise the file descriptor limit when the platform allows it.
 def maybe_raise_nofile_limit(expected_connections: int) -> None:
     try:
         import resource
@@ -664,15 +608,16 @@ def maybe_raise_nofile_limit(expected_connections: int) -> None:
     try:
         soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
         if hard == resource.RLIM_INFINITY:
-            target = max(soft, min(65535, expected_connections * 4 + 2048))
+            target = max(soft, min(65535, expected_connections * 3 + 1024))
         else:
-            target = min(hard, max(soft, expected_connections * 4 + 2048))
+            target = min(hard, max(soft, expected_connections * 3 + 1024))
         if target > soft:
             resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
     except Exception:
         return
 
 
+# Normalize source schemes to the three proxy types we support.
 def normalize_scheme(value: Optional[str]) -> Optional[str]:
     if not value:
         return None
@@ -684,22 +629,36 @@ def normalize_scheme(value: Optional[str]) -> Optional[str]:
     return None
 
 
+# Add IPv6 brackets only when serializing host:port values.
 def format_host(host: str) -> str:
     if ":" in host and not host.startswith("["):
         return f"[{host}]"
     return host
 
 
+# Reject malformed dotted quads that would otherwise slip in as hostnames.
 def normalize_host(host: str) -> Optional[str]:
-    host = host.strip().strip("[]").lower()
+    host = host.strip().strip("[]").lower().rstrip(".")
     if not host:
         return None
+
     try:
         return str(ipaddress.ip_address(host))
     except ValueError:
+        if IPV4_LIKE_RE.fullmatch(host):
+            return None
         return host if HOSTNAME_RE.fullmatch(host) else None
 
 
+# Skip private, loopback, reserved, and otherwise non-routable IPs.
+def is_global_host(host: str) -> bool:
+    try:
+        return ipaddress.ip_address(host).is_global
+    except ValueError:
+        return True
+
+
+# Accept only legal TCP port numbers.
 def valid_port(value: str) -> Optional[int]:
     try:
         port = int(value)
@@ -708,15 +667,17 @@ def valid_port(value: str) -> Optional[int]:
     return port if 1 <= port <= 65535 else None
 
 
+# Remove wrappers and tiny punctuation noise around proxy tokens.
 def strip_token(token: str) -> str:
     token = token.strip()
-    token = token.strip("\"'`<>(){}")
+    token = token.strip('"\'`<>(){}')
     token = token.strip(",;")
     if not (token.startswith("[") and "]:" in token):
         token = token.strip("[]")
     return token.rstrip(".:")
 
 
+# Parse host, port, and optional auth from raw input text.
 def parse_host_port(raw: str) -> Optional[Tuple[str, int, Optional[str], Optional[str]]]:
     token = strip_token(raw)
     if not token or token.startswith("#"):
@@ -735,7 +696,7 @@ def parse_host_port(raw: str) -> Optional[Tuple[str, int, Optional[str], Optiona
         if not host or port is None:
             return None
         normalized_host = normalize_host(host)
-        if not normalized_host:
+        if not normalized_host or not is_global_host(normalized_host):
             return None
         return normalized_host, port, split.username, split.password
 
@@ -761,18 +722,19 @@ def parse_host_port(raw: str) -> Optional[Tuple[str, int, Optional[str], Optiona
 
     normalized_host = normalize_host(host)
     port = valid_port(port_text)
-    if not normalized_host or port is None:
+    if not normalized_host or port is None or not is_global_host(normalized_host):
         return None
 
     return normalized_host, port, username, password
 
 
-def parse_proxy_token(token: str, default_scheme: Optional[str]) -> Optional[ProxyCandidate]:
+# Parse one token into a normalized proxy candidate.
+def parse_proxy_token(token: str, source: SourceSpec) -> Optional[ProxyCandidate]:
     token = strip_token(token)
     if not token or token.startswith("#"):
         return None
 
-    scheme = default_scheme
+    scheme = source.scheme_hint
     if "://" in token:
         scheme = normalize_scheme(urlsplit(token).scheme)
     if not scheme:
@@ -788,25 +750,40 @@ def parse_proxy_token(token: str, default_scheme: Optional[str]) -> Optional[Pro
         port=port,
         username=username,
         password=password,
+        source_name=source.name,
+        source_priority=source.priority,
     )
 
 
+# Try to extract either IPv4 or IPv6 from small JSON/text responses.
 def extract_ip(text: str) -> Optional[str]:
+    def try_one(value: str) -> Optional[str]:
+        token = value.strip().strip('"\'[](){}<>,;')
+        with suppress(ValueError):
+            return str(ipaddress.ip_address(token))
+        return None
+
     try:
         data = json.loads(text)
-        for key in ("ip", "origin"):
-            value = data.get(key)
-            if isinstance(value, str):
-                for part in [x.strip() for x in value.split(",") if x.strip()]:
-                    if IPV4_EXTRACT_RE.fullmatch(part):
-                        return part
+        if isinstance(data, dict):
+            for key in ("ip", "origin", "query"):
+                value = data.get(key)
+                if isinstance(value, str):
+                    for part in re.split(r"[\s,]+", value):
+                        ip_text = try_one(part)
+                        if ip_text:
+                            return ip_text
     except Exception:
         pass
 
-    match = IPV4_EXTRACT_RE.search(text)
-    return match.group(0) if match else None
+    for part in re.split(r"[\s,]+", text):
+        ip_text = try_one(part)
+        if ip_text:
+            return ip_text
+    return None
 
 
+# Stream and parse a text source without loading the whole response into memory.
 async def read_text_tokens(response, source: SourceSpec, per_source_limit: int) -> List[ProxyCandidate]:
     limit = source.max_items or per_source_limit
     if source.max_items and per_source_limit > 0:
@@ -825,7 +802,7 @@ async def read_text_tokens(response, source: SourceSpec, per_source_limit: int) 
         parts = TOKEN_SPLIT_RE.split(buffer)
         buffer = parts.pop() if parts else ""
         for token in parts:
-            candidate = parse_proxy_token(token, source.scheme_hint)
+            candidate = parse_proxy_token(token, source)
             if candidate is None:
                 continue
             if candidate.key in seen:
@@ -836,13 +813,14 @@ async def read_text_tokens(response, source: SourceSpec, per_source_limit: int) 
                 return found
 
     if buffer:
-        candidate = parse_proxy_token(buffer, source.scheme_hint)
+        candidate = parse_proxy_token(buffer, source)
         if candidate is not None and candidate.key not in seen:
             found.append(candidate)
 
     return found[:limit]
 
 
+# Fetch one source, trying every mirror until we get enough parsable data.
 async def fetch_one_source(session, source: SourceSpec, per_source_limit: int) -> Tuple[SourceResult, List[ProxyCandidate]]:
     last_error: Optional[str] = None
     for url in source.urls:
@@ -852,24 +830,103 @@ async def fetch_one_source(session, source: SourceSpec, per_source_limit: int) -
                     last_error = f"HTTP {response.status}"
                     continue
                 items = await read_text_tokens(response, source, per_source_limit)
-                return SourceResult(source=source, count=len(items), error=None), items
+                if len(items) < source.min_items:
+                    last_error = "parsed 0 items"
+                    continue
+                return SourceResult(source=source, count=len(items), url_used=url, error=None), items
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             last_error = str(exc)
-    return SourceResult(source=source, count=0, error=last_error or "download failed"), []
+    return SourceResult(source=source, count=0, url_used=None, error=last_error or "download failed"), []
 
 
+# Merge duplicates while keeping the higher-priority source metadata.
+def merge_unique_candidates(candidates: Iterable[ProxyCandidate]) -> List[ProxyCandidate]:
+    merged: Dict[Tuple[str, str, int, Optional[str], Optional[str]], ProxyCandidate] = {}
+    for candidate in candidates:
+        existing = merged.get(candidate.key)
+        if existing is None or candidate.source_priority < existing.source_priority:
+            merged[candidate.key] = candidate
+    return list(merged.values())
+
+
+# Interleave sources so one weak source cannot dominate the whole queue.
+def order_candidates(candidates: Sequence[ProxyCandidate]) -> List[ProxyCandidate]:
+    buckets: Dict[str, Dict[str, Deque[ProxyCandidate]]] = {
+        scheme: defaultdict(deque) for scheme in SCHEME_ORDER
+    }
+    source_priority: Dict[str, int] = {}
+
+    for candidate in sorted(
+        candidates,
+        key=lambda item: (item.source_priority, item.source_name, item.scheme, item.host, item.port),
+    ):
+        source_priority[candidate.source_name] = candidate.source_priority
+        buckets[candidate.scheme][candidate.source_name].append(candidate)
+
+    ordered_source_names = [
+        name for name, _ in sorted(source_priority.items(), key=lambda item: (item[1], item[0]))
+    ]
+
+    ordered: List[ProxyCandidate] = []
+    for scheme in SCHEME_ORDER:
+        active = [name for name in ordered_source_names if buckets[scheme].get(name)]
+        while active:
+            next_active: List[str] = []
+            for name in active:
+                bucket = buckets[scheme][name]
+                if not bucket:
+                    continue
+                ordered.append(bucket.popleft())
+                if bucket:
+                    next_active.append(name)
+            active = next_active
+    return ordered
+
+
+# Build parsed targets once for all workers.
+def build_probe_targets(urls: Sequence[str]) -> List[ProbeTarget]:
+    targets: List[ProbeTarget] = []
+    for raw_url in urls:
+        split = urlsplit(raw_url)
+        scheme = split.scheme.lower()
+        host = split.hostname
+        if scheme not in {"http", "https"} or not host:
+            raise ValueError(f"Unsupported probe URL: {raw_url}")
+        port = split.port or (443 if scheme == "https" else 80)
+        path_qs = split.path or "/"
+        if split.query:
+            path_qs += "?" + split.query
+        targets.append(
+            ProbeTarget(
+                raw_url=raw_url,
+                scheme=scheme,
+                host=host,
+                port=port,
+                path_qs=path_qs,
+            )
+        )
+    return targets
+
+
+# Fetch sources in priority batches so fast sources start earlier.
 async def fetch_all_sources(args) -> Tuple[List[ProxyCandidate], List[SourceResult]]:
     aiohttp, _ = ensure_runtime_deps()
     headers = {"User-Agent": USER_AGENT}
     timeout = aiohttp.ClientTimeout(total=max(5.0, args.source_timeout))
-    connector = aiohttp.TCPConnector(limit=0, ttl_dns_cache=300, enable_cleanup_closed=_connector_cleanup_closed_enabled())
-    semaphore = asyncio.Semaphore(max(1, args.source_workers))
+    connector = aiohttp.TCPConnector(
+        limit=0,
+        ttl_dns_cache=300,
+        enable_cleanup_closed=_connector_cleanup_closed_enabled(),
+    )
 
-    async def bounded_fetch(session, source: SourceSpec):
-        async with semaphore:
-            return await fetch_one_source(session, source, args.per_source_limit)
+    candidate_goal = max(1000, args.need * DEFAULT_CANDIDATE_MULTIPLIER)
+    per_source_limit = args.per_source_limit
+    ordered_sources = sorted(SOURCES, key=lambda item: (item.priority, item.name))
+
+    collected: List[ProxyCandidate] = []
+    results: List[SourceResult] = []
 
     async with aiohttp.ClientSession(
         connector=connector,
@@ -877,29 +934,39 @@ async def fetch_all_sources(args) -> Tuple[List[ProxyCandidate], List[SourceResu
         headers=headers,
         trust_env=False,
     ) as session:
-        tasks = [asyncio.create_task(bounded_fetch(session, source)) for source in SOURCES]
-        gathered = await asyncio.gather(*tasks, return_exceptions=True)
+        for start in range(0, len(ordered_sources), max(1, args.source_batch_size)):
+            batch = ordered_sources[start : start + max(1, args.source_batch_size)]
+            semaphore = asyncio.Semaphore(max(1, min(args.source_workers, len(batch))))
 
-    ordered_lists: List[List[ProxyCandidate]] = []
-    results: List[SourceResult] = []
-    for source, item in zip(SOURCES, gathered):
-        if isinstance(item, Exception):
-            results.append(SourceResult(source=source, count=0, error=str(item)))
-            ordered_lists.append([])
-            continue
-        result, candidates = item
-        results.append(result)
-        ordered_lists.append(candidates)
+            async def bounded_fetch(source: SourceSpec):
+                async with semaphore:
+                    return await fetch_one_source(session, source, per_source_limit)
 
-    merged: Dict[str, ProxyCandidate] = {}
-    for candidates in ordered_lists:
-        for candidate in candidates:
-            merged.setdefault(candidate.proxy_url, candidate)
+            gathered = await asyncio.gather(
+                *(bounded_fetch(source) for source in batch),
+                return_exceptions=True,
+            )
 
-    return list(merged.values()), results
+            for source, item in zip(batch, gathered):
+                if isinstance(item, Exception):
+                    results.append(SourceResult(source=source, count=0, error=str(item)))
+                    continue
+                result, items = item
+                results.append(result)
+                if items:
+                    collected.extend(items)
+
+            unique_count = len(merge_unique_candidates(collected))
+            if unique_count >= candidate_goal:
+                break
+
+    unique_candidates = merge_unique_candidates(collected)
+    return order_candidates(unique_candidates), results
 
 
 class ResultWriter:
+    """Write one proxy per line with immediate flush but without expensive fsync."""
+
     def __init__(self, path: str):
         self.path = path
         self.handle = None
@@ -925,32 +992,29 @@ class ResultWriter:
         self.written.add(line)
         self.handle.write(line + "\n")
         self.handle.flush()
-        try:
-            os.fsync(self.handle.fileno())
-        except Exception:
-            pass
         return True
 
 
 class SharedState:
+    """Track global worker counters and stop conditions."""
+
     def __init__(self, need: int):
         self.need = need
         self.tested = 0
         self.found = 0
-        self.next_index = 0
         self.seen_working = set()
-        self.seen_tested = set()
         self.stop_event = asyncio.Event()
-        self.index_lock = asyncio.Lock()
         self.result_lock = asyncio.Lock()
         self.started_at = time.time()
 
 
+# Read only a tiny direct HTTP response payload.
 async def read_small_text(response, limit: int = 2048) -> str:
     data = await response.content.read(limit)
     return data.decode("utf-8", errors="ignore")
 
 
+# Detect the direct public IP to support strict IP-change mode.
 async def fetch_direct_ip(http_session, ip_url: str) -> Optional[str]:
     try:
         async with http_session.get(ip_url, allow_redirects=True) as response:
@@ -961,42 +1025,143 @@ async def fetch_direct_ip(http_session, ip_url: str) -> Optional[str]:
         return None
 
 
-async def request_via_proxy(http_session, ProxyConnector, aiohttp, candidate: ProxyCandidate, url: str, timeout_s: float) -> Tuple[bool, Optional[str]]:
-    if candidate.scheme == "http":
-        try:
-            async with http_session.get(url, proxy=candidate.proxy_url, allow_redirects=True) as response:
-                if response.status >= 400:
-                    return False, None
-                return True, await read_small_text(response, limit=4096)
-        except Exception:
-            return False, None
+# Create an SSL context for tunnel checks.
+def build_tls_context(verify_tls: bool) -> ssl.SSLContext:
+    if verify_tls:
+        return ssl.create_default_context()
+    context = ssl.create_default_context()
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    return context
+
+
+# Close an asyncio writer quietly in all supported Python versions.
+async def close_writer(writer) -> None:
+    if writer is None:
+        return
+    with suppress(Exception):
+        writer.close()
+    wait_closed = getattr(writer, "wait_closed", None)
+    if wait_closed is not None:
+        with suppress(Exception):
+            await wait_closed()
+
+
+# Read the status line, headers, and an optional small body from a raw HTTP stream.
+async def read_http_response(reader, timeout_s: float, body_limit: int = 0) -> Tuple[Optional[int], str]:
+    try:
+        status_line = await asyncio.wait_for(reader.readline(), timeout=timeout_s)
+    except Exception:
+        return None, ""
+    if not status_line:
+        return None, ""
+
+    parts = status_line.split(None, 2)
+    if len(parts) < 2:
+        return None, ""
 
     try:
-        connector = ProxyConnector.from_url(candidate.proxy_url)
-        client_timeout = aiohttp.ClientTimeout(total=max(0.5, timeout_s))
-        async with aiohttp.ClientSession(
-            connector=connector,
-            timeout=client_timeout,
-            headers={"User-Agent": USER_AGENT},
-            trust_env=False,
-        ) as session:
-            async with session.get(url, allow_redirects=True) as response:
-                if response.status >= 400:
-                    return False, None
-                return True, await read_small_text(response, limit=4096)
+        status = int(parts[1])
+    except Exception:
+        return None, ""
+
+    while True:
+        try:
+            header_line = await asyncio.wait_for(reader.readline(), timeout=timeout_s)
+        except Exception:
+            return status, ""
+        if not header_line or header_line in {b"\r\n", b"\n"}:
+            break
+
+    if body_limit <= 0:
+        return status, ""
+
+    try:
+        body = await asyncio.wait_for(reader.read(body_limit), timeout=min(timeout_s, 1.5))
+    except Exception:
+        body = b""
+    return status, body.decode("utf-8", errors="ignore")
+
+
+# Send one lightweight HTTP request through a proxy tunnel.
+async def request_via_proxy(
+    AsyncProxy,
+    candidate: ProxyCandidate,
+    target: ProbeTarget,
+    timeout_s: float,
+    tls_context: ssl.SSLContext,
+    body_limit: int = 0,
+) -> Tuple[bool, Optional[str]]:
+    proxy = AsyncProxy.from_url(candidate.proxy_url)
+    sock = None
+    writer = None
+
+    try:
+        sock = await proxy.connect(dest_host=target.host, dest_port=target.port, timeout=timeout_s)
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(
+                host=None,
+                port=None,
+                sock=sock,
+                ssl=tls_context if target.scheme == "https" else None,
+                server_hostname=target.host if target.scheme == "https" else None,
+            ),
+            timeout=timeout_s,
+        )
+
+        request = (
+            f"GET {target.path_qs} HTTP/1.1\r\n"
+            f"Host: {target.host}\r\n"
+            f"User-Agent: {USER_AGENT}\r\n"
+            "Accept: */*\r\n"
+            "Connection: close\r\n\r\n"
+        ).encode("ascii", errors="ignore")
+        writer.write(request)
+        await asyncio.wait_for(writer.drain(), timeout=timeout_s)
+
+        status, body = await read_http_response(reader, timeout_s, body_limit=body_limit)
+        if status is None or status >= 400:
+            return False, None
+        return True, body
     except Exception:
         return False, None
+    finally:
+        await close_writer(writer)
+        if writer is None and sock is not None:
+            with suppress(Exception):
+                sock.close()
 
 
-async def test_candidate(http_session, ProxyConnector, aiohttp, candidate: ProxyCandidate, args, baseline_ip: Optional[str]) -> bool:
-    ok, _ = await request_via_proxy(http_session, ProxyConnector, aiohttp, candidate, args.test_url, args.timeout)
-    if not ok:
+# Check one proxy against one or more small probe URLs.
+async def test_candidate(AsyncProxy, candidate: ProxyCandidate, args, baseline_ip: Optional[str], tls_context) -> bool:
+    reached = False
+    for target in args.probe_targets:
+        ok, _ = await request_via_proxy(
+            AsyncProxy=AsyncProxy,
+            candidate=candidate,
+            target=target,
+            timeout_s=args.timeout,
+            tls_context=tls_context,
+            body_limit=0,
+        )
+        if ok:
+            reached = True
+            break
+
+    if not reached:
         return False
 
     if args.require_different_ip:
         if not baseline_ip:
             return False
-        ok, text = await request_via_proxy(http_session, ProxyConnector, aiohttp, candidate, args.ip_url, args.timeout)
+        ok, text = await request_via_proxy(
+            AsyncProxy=AsyncProxy,
+            candidate=candidate,
+            target=args.ip_target,
+            timeout_s=args.timeout,
+            tls_context=tls_context,
+            body_limit=4096,
+        )
         if not ok or not text:
             return False
         observed_ip = extract_ip(text)
@@ -1006,65 +1171,65 @@ async def test_candidate(http_session, ProxyConnector, aiohttp, candidate: Proxy
     return True
 
 
-def status_line(tested: int, total: int, found: int, need: int) -> str:
+# Compose a compact live progress line for the terminal.
+def status_line(tested: int, total: int, found: int, need: int, started_at: float) -> str:
+    elapsed = max(0.001, time.time() - started_at)
+    rate = tested / elapsed
     tested_text = paint(f"Tested {tested}/{total}", Ansi.CYAN)
     working_text = paint(f"working={found}", Ansi.GREEN if found > 0 else Ansi.DIM)
     need_text = paint(f"need={need}", Ansi.YELLOW)
-    return f"{tested_text} | {working_text} | {need_text}"
+    rate_text = paint(f"rate={rate:.1f}/s", Ansi.MAGENTA)
+    return f"{tested_text} | {working_text} | {need_text} | {rate_text}"
 
 
-async def progress_loop(state: SharedState, total: int, workers: int) -> None:
+# Refresh the status line until workers finish.
+async def progress_loop(state: SharedState, total: int) -> None:
     while not state.stop_event.is_set():
         async with state.result_lock:
-            line = status_line(state.tested, total, state.found, state.need)
+            line = status_line(state.tested, total, state.found, state.need, state.started_at)
         print("\r" + line + " " * 10, end="", file=sys.stderr, flush=True)
         await asyncio.sleep(0.35)
 
     async with state.result_lock:
-        line = status_line(state.tested, total, state.found, state.need)
+        line = status_line(state.tested, total, state.found, state.need, state.started_at)
     print("\r" + line + " " * 10, file=sys.stderr, flush=True)
 
 
+# Pull one candidate at a time from the queue and test it.
 async def worker_loop(
     state: SharedState,
-    candidates: Sequence[ProxyCandidate],
-    http_session,
-    ProxyConnector,
-    aiohttp,
+    queue: "asyncio.Queue[ProxyCandidate]",
+    AsyncProxy,
     args,
     baseline_ip: Optional[str],
+    tls_context: ssl.SSLContext,
     writer: ResultWriter,
 ) -> None:
     while not state.stop_event.is_set():
-        async with state.index_lock:
-            if state.stop_event.is_set() or state.next_index >= len(candidates):
-                return
-            index = state.next_index
-            state.next_index += 1
+        try:
+            candidate = queue.get_nowait()
+        except asyncio.QueueEmpty:
+            return
 
-        candidate = candidates[index]
-        proxy_url = candidate.proxy_url
-
-        async with state.result_lock:
-            if proxy_url in state.seen_tested:
-                continue
-            state.seen_tested.add(proxy_url)
-
-        ok = await test_candidate(http_session, ProxyConnector, aiohttp, candidate, args, baseline_ip)
+        ok = await test_candidate(AsyncProxy, candidate, args, baseline_ip, tls_context)
 
         async with state.result_lock:
             state.tested += 1
             if not ok:
                 continue
+
+            proxy_url = candidate.proxy_url
             if proxy_url in state.seen_working:
                 continue
             if state.found >= state.need:
                 state.stop_event.set()
                 return
+
             wrote = writer.write_line(proxy_url)
             if not wrote:
                 state.seen_working.add(proxy_url)
                 continue
+
             state.seen_working.add(proxy_url)
             state.found += 1
             if state.found >= state.need:
@@ -1072,16 +1237,26 @@ async def worker_loop(
                 return
 
 
+# Run the full proxy-checking worker pool and stop once enough proxies are found.
 async def run_checks(candidates: Sequence[ProxyCandidate], args) -> Tuple[int, int, float, Optional[str]]:
-    aiohttp, aiohttp_socks = ensure_runtime_deps()
-    ProxyConnector = aiohttp_socks.ProxyConnector
+    aiohttp, python_socks_asyncio = ensure_runtime_deps()
+    AsyncProxy = python_socks_asyncio.Proxy
 
     maybe_raise_nofile_limit(args.workers)
 
     timeout = aiohttp.ClientTimeout(total=max(0.5, args.timeout))
-    connector = aiohttp.TCPConnector(limit=0, ttl_dns_cache=300, enable_cleanup_closed=_connector_cleanup_closed_enabled())
+    connector = aiohttp.TCPConnector(
+        limit=0,
+        ttl_dns_cache=300,
+        enable_cleanup_closed=_connector_cleanup_closed_enabled(),
+    )
     headers = {"User-Agent": USER_AGENT}
     state = SharedState(need=args.need)
+    tls_context = build_tls_context(args.verify_tls)
+
+    queue: "asyncio.Queue[ProxyCandidate]" = asyncio.Queue()
+    for candidate in candidates:
+        queue.put_nowait(candidate)
 
     with ResultWriter(args.output) as writer:
         async with aiohttp.ClientSession(
@@ -1103,15 +1278,15 @@ async def run_checks(candidates: Sequence[ProxyCandidate], args) -> Tuple[int, i
                     )
                     args.require_different_ip = False
 
-            progress_task = asyncio.create_task(progress_loop(state, len(candidates), args.workers))
+            progress_task = asyncio.create_task(progress_loop(state, len(candidates)))
             workers = [
                 asyncio.create_task(
-                    worker_loop(state, candidates, http_session, ProxyConnector, aiohttp, args, baseline_ip, writer)
+                    worker_loop(state, queue, AsyncProxy, args, baseline_ip, tls_context, writer)
                 )
                 for _ in range(max(1, args.workers))
             ]
-            stop_waiter = asyncio.create_task(state.stop_event.wait())
             gather_future = asyncio.gather(*workers, return_exceptions=True)
+            stop_waiter = asyncio.create_task(state.stop_event.wait())
 
             try:
                 done, _ = await asyncio.wait(
@@ -1124,6 +1299,7 @@ async def run_checks(candidates: Sequence[ProxyCandidate], args) -> Tuple[int, i
                     await asyncio.gather(*workers, return_exceptions=True)
                 else:
                     state.stop_event.set()
+                    await gather_future
             finally:
                 state.stop_event.set()
                 if not stop_waiter.done():
@@ -1135,6 +1311,7 @@ async def run_checks(candidates: Sequence[ProxyCandidate], args) -> Tuple[int, i
     return state.tested, state.found, elapsed, baseline_ip
 
 
+# Ask interactively only when stdin is a terminal and --need was not passed.
 def prompt_for_need(default_need: int = DEFAULT_NEED) -> int:
     if not sys.stdin or not sys.stdin.isatty():
         return default_need
@@ -1156,29 +1333,42 @@ def prompt_for_need(default_need: int = DEFAULT_NEED) -> int:
             print("Please enter a valid integer.")
 
 
+# Keep source parsing aggressive enough without downloading everything.
 def auto_per_source_limit(need: int) -> int:
-    return min(12000, max(3000, need * 120))
+    return min(6000, max(1200, need * 45))
 
 
+# Print a short fetch summary plus the strongest source counts.
 def print_source_summary(results: Iterable[SourceResult], total_unique: int) -> None:
-    ok_count = sum(1 for item in results if not item.error)
-    source_total = sum(1 for _ in results)
+    rows = list(results)
+    ok_rows = [item for item in rows if not item.error and item.count > 0]
+    failed_rows = [item for item in rows if item.error]
     print(
-        f"{paint('Fetched sources', Ansi.BLUE)}: {ok_count}/{source_total} | "
+        f"{paint('Fetched sources', Ansi.BLUE)}: {len(ok_rows)}/{len(rows)} | "
         f"{paint('unique candidates', Ansi.CYAN)}: {total_unique:,}",
         file=sys.stderr,
     )
+    if ok_rows:
+        top = ", ".join(
+            f"{item.source.name}={item.count}"
+            for item in sorted(ok_rows, key=lambda row: row.count, reverse=True)[:6]
+        )
+        print(f"top sources: {top}", file=sys.stderr)
+    if failed_rows:
+        failed_preview = ", ".join(item.source.name for item in failed_rows[:6])
+        print(f"failed/skipped: {failed_preview}", file=sys.stderr)
 
 
+# Print the built-in source catalog and exit.
 def list_sources() -> None:
-    for item in SOURCES:
-        hint = item.scheme_hint or "mixed"
-        print(f"{item.name}\t{hint}\t{item.urls[0]}")
+    for item in sorted(SOURCES, key=lambda source: (source.priority, source.name)):
+        print(f"{item.priority}\t{item.name}\t{item.scheme_hint}\t{item.urls[0]}")
 
 
+# Build the CLI parser.
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
-        description="Fetch public proxies from many GitHub sources and save working ones to one file."
+        description="Fetch public proxies from curated public sources and save working ones to one file."
     )
     ap.add_argument("--need", type=int, default=0, help="How many working proxies to save.")
     ap.add_argument(
@@ -1197,12 +1387,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--timeout",
         type=float,
         default=DEFAULT_TIMEOUT,
-        help=f"Per-request timeout in seconds (default: {DEFAULT_TIMEOUT}).",
+        help=f"Per-proxy timeout in seconds (default: {DEFAULT_TIMEOUT}).",
     )
     ap.add_argument(
         "--test-url",
-        default=DEFAULT_TEST_URL,
-        help="URL used to verify proxy reachability.",
+        action="append",
+        dest="test_urls",
+        default=None,
+        help="Probe URL used to verify proxy reachability. Can be passed multiple times.",
     )
     ap.add_argument(
         "--ip-url",
@@ -1215,6 +1407,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Only keep proxies that change the observed public IP.",
     )
     ap.add_argument(
+        "--verify-tls",
+        action="store_true",
+        help="Verify TLS certificates during proxy checks. Off by default for reachability speed.",
+    )
+    ap.add_argument(
         "--source-timeout",
         type=float,
         default=DEFAULT_SOURCE_TIMEOUT,
@@ -1224,7 +1421,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--source-workers",
         type=int,
         default=DEFAULT_SOURCE_WORKERS,
-        help=f"Concurrent source downloads (default: {DEFAULT_SOURCE_WORKERS}).",
+        help=f"Concurrent source downloads inside one batch (default: {DEFAULT_SOURCE_WORKERS}).",
+    )
+    ap.add_argument(
+        "--source-batch-size",
+        type=int,
+        default=DEFAULT_SOURCE_BATCH_SIZE,
+        help=f"How many sources to fetch before re-evaluating candidate count (default: {DEFAULT_SOURCE_BATCH_SIZE}).",
     )
     ap.add_argument(
         "--per-source-limit",
@@ -1235,11 +1438,12 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument(
         "--list-sources",
         action="store_true",
-        help="Print built-in sources and exit.",
+        help="Print built-in curated sources and exit.",
     )
     return ap
 
 
+# Run source fetching first, then proxy testing.
 async def async_main(args) -> int:
     install_asyncio_exception_filter()
     candidates, source_results = await fetch_all_sources(args)
@@ -1265,6 +1469,7 @@ async def async_main(args) -> int:
     return 0
 
 
+# Parse CLI input, apply defaults, and launch the async entry point.
 def main() -> int:
     if not _python_version_ok():
         print("ERROR: Please run with Python 3.8+.", file=sys.stderr)
@@ -1283,9 +1488,17 @@ def main() -> int:
     args.workers = max(1, int(args.workers))
     args.timeout = max(0.5, float(args.timeout))
     args.source_workers = max(1, int(args.source_workers))
+    args.source_batch_size = max(1, int(args.source_batch_size))
     args.per_source_limit = int(args.per_source_limit)
     if args.per_source_limit <= 0:
         args.per_source_limit = auto_per_source_limit(args.need)
+
+    try:
+        args.probe_targets = build_probe_targets(args.test_urls or list(DEFAULT_TEST_URLS))
+        args.ip_target = build_probe_targets([args.ip_url])[0]
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
 
     try:
         return asyncio.run(async_main(args))
