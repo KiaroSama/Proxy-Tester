@@ -43,6 +43,9 @@ DEFAULT_SOURCE_WORKERS = 12
 DEFAULT_PER_SOURCE_LIMIT = 0
 DEFAULT_SOURCE_BATCH_SIZE = 6
 DEFAULT_CANDIDATE_MULTIPLIER = 60
+RECENT_RATE_WINDOW = 4.0
+PROBE_DEADLINE_GRACE = 0.15
+STRICT_IP_TIMEOUT_CAP = 1.5
 DEFAULT_TEST_URLS: Tuple[str, ...] = (
     "https://www.gstatic.com/generate_204",
     "https://cp.cloudflare.com/generate_204",
@@ -531,12 +534,103 @@ SOURCES: Tuple[SourceSpec, ...] = (
         max_items=1200,
     ),
     SourceSpec(
+        name="zaeem_http",
+        urls=(
+            "https://raw.githubusercontent.com/Zaeem20/FREE_PROXIES_LIST/master/http.txt",
+            "https://raw.githubusercontent.com/Zaeem20/FREE_PROXIES_LIST/master/https.txt",
+        ),
+        scheme_hint="http",
+        priority=22,
+        max_items=1600,
+    ),
+    SourceSpec(
+        name="zaeem_socks4",
+        urls=(
+            "https://raw.githubusercontent.com/Zaeem20/FREE_PROXIES_LIST/master/socks4.txt",
+        ),
+        scheme_hint="socks4",
+        priority=22,
+        max_items=1200,
+    ),
+    SourceSpec(
+        name="aliilapro_http",
+        urls=(
+            "https://raw.githubusercontent.com/ALIILAPRO/Proxy/main/http.txt",
+        ),
+        scheme_hint="http",
+        priority=23,
+        max_items=1600,
+    ),
+    SourceSpec(
+        name="aliilapro_socks4",
+        urls=(
+            "https://raw.githubusercontent.com/ALIILAPRO/Proxy/main/socks4.txt",
+        ),
+        scheme_hint="socks4",
+        priority=23,
+        max_items=1200,
+    ),
+    SourceSpec(
+        name="argh94_http",
+        urls=(
+            "https://raw.githubusercontent.com/Argh94/Proxy-List/main/HTTP.txt",
+        ),
+        scheme_hint="http",
+        priority=24,
+        max_items=1800,
+    ),
+    SourceSpec(
+        name="argh94_socks4",
+        urls=(
+            "https://raw.githubusercontent.com/Argh94/Proxy-List/main/SOCKS4.txt",
+        ),
+        scheme_hint="socks4",
+        priority=24,
+        max_items=1200,
+    ),
+    SourceSpec(
+        name="argh94_socks5",
+        urls=(
+            "https://raw.githubusercontent.com/Argh94/Proxy-List/main/SOCKS5.txt",
+        ),
+        scheme_hint="socks5",
+        priority=24,
+        max_items=1200,
+    ),
+    SourceSpec(
+        name="vmheaven_http",
+        urls=(
+            "https://raw.githubusercontent.com/vmheaven/VMHeaven-Free-Proxy-Updated/main/http.txt",
+        ),
+        scheme_hint="http",
+        priority=25,
+        max_items=1600,
+    ),
+    SourceSpec(
+        name="vmheaven_socks4",
+        urls=(
+            "https://raw.githubusercontent.com/vmheaven/VMHeaven-Free-Proxy-Updated/main/socks4.txt",
+        ),
+        scheme_hint="socks4",
+        priority=25,
+        max_items=1200,
+    ),
+    SourceSpec(
+        name="vmheaven_socks5",
+        urls=(
+            "https://raw.githubusercontent.com/vmheaven/VMHeaven-Free-Proxy-Updated/main/socks5.txt",
+        ),
+        scheme_hint="socks5",
+        priority=25,
+        max_items=1200,
+    ),
+    SourceSpec(
         name="hookzof_socks5",
         urls=(
             "https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt",
         ),
         scheme_hint="socks5",
-        priority=26,
+        priority=30,
         max_items=1200,
     ),
 )
@@ -831,7 +925,7 @@ async def fetch_one_source(session, source: SourceSpec, per_source_limit: int) -
                     continue
                 items = await read_text_tokens(response, source, per_source_limit)
                 if len(items) < source.min_items:
-                    last_error = "parsed 0 items"
+                    last_error = f"parsed {len(items)} items"
                     continue
                 return SourceResult(source=source, count=len(items), url_used=url, error=None), items
         except asyncio.CancelledError:
@@ -925,7 +1019,7 @@ async def fetch_all_sources(args) -> Tuple[List[ProxyCandidate], List[SourceResu
     per_source_limit = args.per_source_limit
     ordered_sources = sorted(SOURCES, key=lambda item: (item.priority, item.name))
 
-    collected: List[ProxyCandidate] = []
+    merged_candidates: Dict[Tuple[str, str, int, Optional[str], Optional[str]], ProxyCandidate] = {}
     results: List[SourceResult] = []
 
     async with aiohttp.ClientSession(
@@ -953,15 +1047,15 @@ async def fetch_all_sources(args) -> Tuple[List[ProxyCandidate], List[SourceResu
                     continue
                 result, items = item
                 results.append(result)
-                if items:
-                    collected.extend(items)
+                for candidate in items:
+                    existing = merged_candidates.get(candidate.key)
+                    if existing is None or candidate.source_priority < existing.source_priority:
+                        merged_candidates[candidate.key] = candidate
 
-            unique_count = len(merge_unique_candidates(collected))
-            if unique_count >= candidate_goal:
+            if len(merged_candidates) >= candidate_goal:
                 break
 
-    unique_candidates = merge_unique_candidates(collected)
-    return order_candidates(unique_candidates), results
+    return order_candidates(list(merged_candidates.values())), results
 
 
 class ResultWriter:
@@ -1002,6 +1096,8 @@ class SharedState:
         self.need = need
         self.tested = 0
         self.found = 0
+        self.active = 0
+        self.recent_tests: Deque[float] = deque(maxlen=512)
         self.seen_working = set()
         self.stop_event = asyncio.Event()
         self.result_lock = asyncio.Lock()
@@ -1047,10 +1143,18 @@ async def close_writer(writer) -> None:
             await wait_closed()
 
 
+# Return the remaining wall-clock budget for one in-flight network step.
+def seconds_left(deadline: float) -> float:
+    return max(0.0, deadline - time.monotonic())
+
+
 # Read the status line, headers, and an optional small body from a raw HTTP stream.
-async def read_http_response(reader, timeout_s: float, body_limit: int = 0) -> Tuple[Optional[int], str]:
+async def read_http_response(reader, deadline: float, body_limit: int = 0) -> Tuple[Optional[int], str]:
     try:
-        status_line = await asyncio.wait_for(reader.readline(), timeout=timeout_s)
+        remaining = seconds_left(deadline)
+        if remaining <= 0:
+            return None, ""
+        status_line = await asyncio.wait_for(reader.readline(), timeout=remaining)
     except Exception:
         return None, ""
     if not status_line:
@@ -1067,7 +1171,10 @@ async def read_http_response(reader, timeout_s: float, body_limit: int = 0) -> T
 
     while True:
         try:
-            header_line = await asyncio.wait_for(reader.readline(), timeout=timeout_s)
+            remaining = seconds_left(deadline)
+            if remaining <= 0:
+                return status, ""
+            header_line = await asyncio.wait_for(reader.readline(), timeout=remaining)
         except Exception:
             return status, ""
         if not header_line or header_line in {b"\r\n", b"\n"}:
@@ -1077,7 +1184,10 @@ async def read_http_response(reader, timeout_s: float, body_limit: int = 0) -> T
         return status, ""
 
     try:
-        body = await asyncio.wait_for(reader.read(body_limit), timeout=min(timeout_s, 1.5))
+        remaining = min(seconds_left(deadline), 1.0)
+        if remaining <= 0:
+            return status, ""
+        body = await asyncio.wait_for(reader.read(body_limit), timeout=remaining)
     except Exception:
         body = b""
     return status, body.decode("utf-8", errors="ignore")
@@ -1088,7 +1198,7 @@ async def request_via_proxy(
     AsyncProxy,
     candidate: ProxyCandidate,
     target: ProbeTarget,
-    timeout_s: float,
+    deadline: float,
     tls_context: ssl.SSLContext,
     body_limit: int = 0,
 ) -> Tuple[bool, Optional[str]]:
@@ -1097,7 +1207,14 @@ async def request_via_proxy(
     writer = None
 
     try:
-        sock = await proxy.connect(dest_host=target.host, dest_port=target.port, timeout=timeout_s)
+        remaining = seconds_left(deadline)
+        if remaining <= 0:
+            return False, None
+        sock = await proxy.connect(dest_host=target.host, dest_port=target.port, timeout=remaining)
+
+        remaining = seconds_left(deadline)
+        if remaining <= 0:
+            return False, None
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(
                 host=None,
@@ -1106,7 +1223,7 @@ async def request_via_proxy(
                 ssl=tls_context if target.scheme == "https" else None,
                 server_hostname=target.host if target.scheme == "https" else None,
             ),
-            timeout=timeout_s,
+            timeout=remaining,
         )
 
         request = (
@@ -1117,9 +1234,13 @@ async def request_via_proxy(
             "Connection: close\r\n\r\n"
         ).encode("ascii", errors="ignore")
         writer.write(request)
-        await asyncio.wait_for(writer.drain(), timeout=timeout_s)
 
-        status, body = await read_http_response(reader, timeout_s, body_limit=body_limit)
+        remaining = seconds_left(deadline)
+        if remaining <= 0:
+            return False, None
+        await asyncio.wait_for(writer.drain(), timeout=remaining)
+
+        status, body = await read_http_response(reader, deadline, body_limit=body_limit)
         if status is None or status >= 400:
             return False, None
         return True, body
@@ -1132,23 +1253,78 @@ async def request_via_proxy(
                 sock.close()
 
 
+# Keep the main reachability probe bounded so the final tail does not stall.
+def probe_deadline(timeout_s: float) -> float:
+    return time.monotonic() + max(0.35, timeout_s + PROBE_DEADLINE_GRACE)
+
+
+# Give strict IP validation its own short budget after reachability succeeds.
+def ip_check_deadline(timeout_s: float) -> float:
+    return time.monotonic() + max(0.5, min(timeout_s + PROBE_DEADLINE_GRACE, STRICT_IP_TIMEOUT_CAP))
+
+
+# Probe multiple small URLs at once and stop on the first success.
+async def probe_reachability(
+    AsyncProxy,
+    candidate: ProxyCandidate,
+    targets: Sequence[ProbeTarget],
+    tls_context: ssl.SSLContext,
+    timeout_s: float,
+) -> bool:
+    deadline = probe_deadline(timeout_s)
+    tasks = {
+        asyncio.create_task(
+            request_via_proxy(
+                AsyncProxy=AsyncProxy,
+                candidate=candidate,
+                target=target,
+                deadline=deadline,
+                tls_context=tls_context,
+                body_limit=0,
+            )
+        )
+        for target in targets
+    }
+
+    try:
+        pending = set(tasks)
+        while pending:
+            remaining = seconds_left(deadline)
+            if remaining <= 0:
+                break
+            done, pending = await asyncio.wait(
+                pending,
+                timeout=remaining,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if not done:
+                break
+            for task in done:
+                ok, _ = task.result()
+                if ok:
+                    for other in pending:
+                        other.cancel()
+                    if pending:
+                        await asyncio.gather(*pending, return_exceptions=True)
+                    return True
+        return False
+    finally:
+        leftovers = [task for task in tasks if not task.done()]
+        for task in leftovers:
+            task.cancel()
+        if leftovers:
+            await asyncio.gather(*leftovers, return_exceptions=True)
+
+
 # Check one proxy against one or more small probe URLs.
 async def test_candidate(AsyncProxy, candidate: ProxyCandidate, args, baseline_ip: Optional[str], tls_context) -> bool:
-    reached = False
-    for target in args.probe_targets:
-        ok, _ = await request_via_proxy(
-            AsyncProxy=AsyncProxy,
-            candidate=candidate,
-            target=target,
-            timeout_s=args.timeout,
-            tls_context=tls_context,
-            body_limit=0,
-        )
-        if ok:
-            reached = True
-            break
-
-    if not reached:
+    if not await probe_reachability(
+        AsyncProxy=AsyncProxy,
+        candidate=candidate,
+        targets=args.probe_targets,
+        tls_context=tls_context,
+        timeout_s=args.timeout,
+    ):
         return False
 
     if args.require_different_ip:
@@ -1158,7 +1334,7 @@ async def test_candidate(AsyncProxy, candidate: ProxyCandidate, args, baseline_i
             AsyncProxy=AsyncProxy,
             candidate=candidate,
             target=args.ip_target,
-            timeout_s=args.timeout,
+            deadline=ip_check_deadline(args.timeout),
             tls_context=tls_context,
             body_limit=4096,
         )
@@ -1171,27 +1347,38 @@ async def test_candidate(AsyncProxy, candidate: ProxyCandidate, args, baseline_i
     return True
 
 
+# Compute a short sliding-window rate so the live number stays truthful near the end.
+def recent_rate(samples: Deque[float], window: float = RECENT_RATE_WINDOW) -> float:
+    now = time.monotonic()
+    while samples and now - samples[0] > window:
+        samples.popleft()
+    if not samples:
+        return 0.0
+    span = max(0.25, min(window, now - samples[0]))
+    return len(samples) / span
+
+
 # Compose a compact live progress line for the terminal.
-def status_line(tested: int, total: int, found: int, need: int, started_at: float) -> str:
-    elapsed = max(0.001, time.time() - started_at)
-    rate = tested / elapsed
-    tested_text = paint(f"Tested {tested}/{total}", Ansi.CYAN)
-    working_text = paint(f"working={found}", Ansi.GREEN if found > 0 else Ansi.DIM)
-    need_text = paint(f"need={need}", Ansi.YELLOW)
+def status_line(state: SharedState, total: int) -> str:
+    rate = recent_rate(state.recent_tests)
+    tested_text = paint(f"Tested {state.tested}/{total}", Ansi.CYAN)
+    working_text = paint(f"working={state.found}", Ansi.GREEN if state.found > 0 else Ansi.DIM)
+    need_text = paint(f"need={state.need}", Ansi.YELLOW)
     rate_text = paint(f"rate={rate:.1f}/s", Ansi.MAGENTA)
-    return f"{tested_text} | {working_text} | {need_text} | {rate_text}"
+    active_text = paint(f"active={state.active}", Ansi.BLUE if state.active > 0 else Ansi.DIM)
+    return f"{tested_text} | {working_text} | {need_text} | {rate_text} | {active_text}"
 
 
 # Refresh the status line until workers finish.
 async def progress_loop(state: SharedState, total: int) -> None:
     while not state.stop_event.is_set():
         async with state.result_lock:
-            line = status_line(state.tested, total, state.found, state.need, state.started_at)
+            line = status_line(state, total)
         print("\r" + line + " " * 10, end="", file=sys.stderr, flush=True)
-        await asyncio.sleep(0.35)
+        await asyncio.sleep(0.25)
 
     async with state.result_lock:
-        line = status_line(state.tested, total, state.found, state.need, state.started_at)
+        line = status_line(state, total)
     print("\r" + line + " " * 10, file=sys.stderr, flush=True)
 
 
@@ -1211,10 +1398,22 @@ async def worker_loop(
         except asyncio.QueueEmpty:
             return
 
-        ok = await test_candidate(AsyncProxy, candidate, args, baseline_ip, tls_context)
+        async with state.result_lock:
+            state.active += 1
+
+        try:
+            ok = await test_candidate(AsyncProxy, candidate, args, baseline_ip, tls_context)
+        except asyncio.CancelledError:
+            async with state.result_lock:
+                state.active = max(0, state.active - 1)
+            raise
+        except Exception:
+            ok = False
 
         async with state.result_lock:
+            state.active = max(0, state.active - 1)
             state.tested += 1
+            state.recent_tests.append(time.monotonic())
             if not ok:
                 continue
 
