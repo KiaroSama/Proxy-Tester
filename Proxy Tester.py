@@ -7,8 +7,10 @@ Highlights:
 - asks how many working proxies you need (default: 50)
 - installs runtime dependencies only when missing
 - uses high async concurrency for faster testing
+- pre-checks source health before full downloads
 - saves each working proxy as soon as it is found
 - stops exactly at the requested number of saved proxies
+- runs repeat reachability checks for more reliable working proxies
 - prefers high-confidence, actively maintained proxy sources
 - prints colorized progress in the terminal
 """
@@ -39,13 +41,19 @@ USER_AGENT = "proxy-tester/6.0"
 DEFAULT_NEED = 50
 DEFAULT_TIMEOUT = 2.5
 DEFAULT_SOURCE_TIMEOUT = 15.0
-DEFAULT_SOURCE_WORKERS = 12
+DEFAULT_SOURCE_HEALTH_TIMEOUT = 4.5
+DEFAULT_SOURCE_HEALTH_BYTES = 16384
+DEFAULT_SOURCE_WORKERS = 20
 DEFAULT_PER_SOURCE_LIMIT = 0
-DEFAULT_SOURCE_BATCH_SIZE = 6
+DEFAULT_SOURCE_BATCH_SIZE = 10
 DEFAULT_CANDIDATE_MULTIPLIER = 60
 RECENT_RATE_WINDOW = 4.0
 PROBE_DEADLINE_GRACE = 0.15
 STRICT_IP_TIMEOUT_CAP = 1.5
+DEFAULT_STABILITY_CHECKS = 2
+DEFAULT_STABILITY_TIMEOUT_FACTOR = 0.8
+DEFAULT_TAIL_DRAIN_TIMEOUT = 0.9
+WRITER_CLOSE_TIMEOUT = 0.25
 DEFAULT_TEST_URLS: Tuple[str, ...] = (
     "https://www.gstatic.com/generate_204",
     "https://cp.cloudflare.com/generate_204",
@@ -62,7 +70,7 @@ HOSTNAME_RE = re.compile(
 def default_worker_count() -> int:
     """Pick a balanced async worker count for typical desktop/server machines."""
     cpu = os.cpu_count() or 4
-    return max(250, min(1200, cpu * 160))
+    return max(400, min(2200, cpu * 220))
 
 
 DEFAULT_WORKERS = default_worker_count()
@@ -166,13 +174,26 @@ def _is_benign_windows_proactor_reset(context: dict) -> bool:
     return "_ProactorBasePipeTransport._call_connection_lost" in probe
 
 
+# Ignore noisy Windows overlapped-cancel warnings during aggressive cancellation.
+def _is_benign_windows_overlapped_cancel(context: dict) -> bool:
+    if os.name != "nt":
+        return False
+    message = str(context.get("message") or "")
+    if "Cancelling an overlapped future failed" not in message:
+        return False
+    exc = context.get("exception")
+    if not isinstance(exc, OSError):
+        return False
+    return getattr(exc, "winerror", None) in {6, 10038}
+
+
 # Install the Windows-specific exception filter once per event loop.
 def install_asyncio_exception_filter() -> None:
     loop = asyncio.get_running_loop()
     previous_handler = loop.get_exception_handler()
 
     def handler(loop_obj, context):
-        if _is_benign_windows_proactor_reset(context):
+        if _is_benign_windows_proactor_reset(context) or _is_benign_windows_overlapped_cancel(context):
             return
         if previous_handler is not None:
             previous_handler(loop_obj, context)
@@ -510,6 +531,7 @@ SOURCES: Tuple[SourceSpec, ...] = (
         name="thespeedx_http",
         urls=(
             "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
+            "https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/http.txt",
         ),
         scheme_hint="http",
         priority=25,
@@ -519,6 +541,7 @@ SOURCES: Tuple[SourceSpec, ...] = (
         name="thespeedx_socks4",
         urls=(
             "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks4.txt",
+            "https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/socks4.txt",
         ),
         scheme_hint="socks4",
         priority=25,
@@ -528,6 +551,7 @@ SOURCES: Tuple[SourceSpec, ...] = (
         name="thespeedx_socks5",
         urls=(
             "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt",
+            "https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/socks5.txt",
         ),
         scheme_hint="socks5",
         priority=25,
@@ -623,6 +647,339 @@ SOURCES: Tuple[SourceSpec, ...] = (
         scheme_hint="socks5",
         priority=25,
         max_items=1200,
+    ),
+    SourceSpec(
+        name="shiftytr_http",
+        urls=(
+            "https://raw.githubusercontent.com/shiftytr/proxy-list/master/http.txt",
+        ),
+        scheme_hint="http",
+        priority=26,
+        max_items=2200,
+    ),
+    SourceSpec(
+        name="shiftytr_https",
+        urls=(
+            "https://raw.githubusercontent.com/shiftytr/proxy-list/master/https.txt",
+        ),
+        scheme_hint="http",
+        priority=26,
+        max_items=1800,
+    ),
+    SourceSpec(
+        name="shiftytr_socks4",
+        urls=(
+            "https://raw.githubusercontent.com/shiftytr/proxy-list/master/socks4.txt",
+        ),
+        scheme_hint="socks4",
+        priority=26,
+        max_items=1600,
+    ),
+    SourceSpec(
+        name="shiftytr_socks5",
+        urls=(
+            "https://raw.githubusercontent.com/shiftytr/proxy-list/master/socks5.txt",
+        ),
+        scheme_hint="socks5",
+        priority=26,
+        max_items=1600,
+    ),
+    SourceSpec(
+        name="firmfox_http",
+        urls=(
+            "https://raw.githubusercontent.com/Firmfox/proxify/main/proxies/http.txt",
+        ),
+        scheme_hint="http",
+        priority=26,
+        max_items=2200,
+    ),
+    SourceSpec(
+        name="firmfox_https",
+        urls=(
+            "https://raw.githubusercontent.com/Firmfox/proxify/main/proxies/https.txt",
+        ),
+        scheme_hint="http",
+        priority=26,
+        max_items=2000,
+    ),
+    SourceSpec(
+        name="firmfox_socks4",
+        urls=(
+            "https://raw.githubusercontent.com/Firmfox/proxify/main/proxies/socks4.txt",
+        ),
+        scheme_hint="socks4",
+        priority=26,
+        max_items=1700,
+    ),
+    SourceSpec(
+        name="firmfox_socks5",
+        urls=(
+            "https://raw.githubusercontent.com/Firmfox/proxify/main/proxies/socks5.txt",
+        ),
+        scheme_hint="socks5",
+        priority=26,
+        max_items=1700,
+    ),
+    SourceSpec(
+        name="proxyscrape_api_http",
+        urls=(
+            "https://api.proxyscrape.com/v2/?request=getproxies&protocol=http&timeout=12000&country=all&ssl=all&anonymity=all",
+        ),
+        scheme_hint="http",
+        priority=27,
+        max_items=2800,
+    ),
+    SourceSpec(
+        name="proxyscrape_api_socks4",
+        urls=(
+            "https://api.proxyscrape.com/v2/?request=getproxies&protocol=socks4&timeout=12000&country=all",
+        ),
+        scheme_hint="socks4",
+        priority=27,
+        max_items=2200,
+    ),
+    SourceSpec(
+        name="proxyscrape_api_socks5",
+        urls=(
+            "https://api.proxyscrape.com/v2/?request=getproxies&protocol=socks5&timeout=12000&country=all",
+        ),
+        scheme_hint="socks5",
+        priority=27,
+        max_items=3200,
+    ),
+    SourceSpec(
+        name="proxyspace_http",
+        urls=(
+            "https://proxyspace.pro/http.txt",
+        ),
+        scheme_hint="http",
+        priority=28,
+        max_items=2600,
+    ),
+    SourceSpec(
+        name="proxyspace_https",
+        urls=(
+            "https://proxyspace.pro/https.txt",
+        ),
+        scheme_hint="http",
+        priority=28,
+        max_items=2000,
+    ),
+    SourceSpec(
+        name="proxyspace_socks4",
+        urls=(
+            "https://proxyspace.pro/socks4.txt",
+        ),
+        scheme_hint="socks4",
+        priority=28,
+        max_items=2200,
+    ),
+    SourceSpec(
+        name="proxyspace_socks5",
+        urls=(
+            "https://proxyspace.pro/socks5.txt",
+        ),
+        scheme_hint="socks5",
+        priority=28,
+        max_items=2600,
+    ),
+    SourceSpec(
+        name="jetkai_http",
+        urls=(
+            "https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-http.txt",
+        ),
+        scheme_hint="http",
+        priority=29,
+        max_items=2400,
+    ),
+    SourceSpec(
+        name="jetkai_socks4",
+        urls=(
+            "https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-socks4.txt",
+        ),
+        scheme_hint="socks4",
+        priority=29,
+        max_items=1800,
+    ),
+    SourceSpec(
+        name="jetkai_socks5",
+        urls=(
+            "https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-socks5.txt",
+        ),
+        scheme_hint="socks5",
+        priority=29,
+        max_items=1700,
+    ),
+    SourceSpec(
+        name="rdavydov_http",
+        urls=(
+            "https://raw.githubusercontent.com/rdavydov/proxy-list/main/proxies/http.txt",
+        ),
+        scheme_hint="http",
+        priority=30,
+        max_items=2200,
+    ),
+    SourceSpec(
+        name="rdavydov_http_anonymous",
+        urls=(
+            "https://raw.githubusercontent.com/rdavydov/proxy-list/main/proxies_anonymous/http.txt",
+        ),
+        scheme_hint="http",
+        priority=30,
+        max_items=1600,
+    ),
+    SourceSpec(
+        name="rdavydov_socks4",
+        urls=(
+            "https://raw.githubusercontent.com/rdavydov/proxy-list/main/proxies/socks4.txt",
+        ),
+        scheme_hint="socks4",
+        priority=30,
+        max_items=1700,
+    ),
+    SourceSpec(
+        name="rdavydov_socks5",
+        urls=(
+            "https://raw.githubusercontent.com/rdavydov/proxy-list/main/proxies/socks5.txt",
+        ),
+        scheme_hint="socks5",
+        priority=30,
+        max_items=1700,
+    ),
+    SourceSpec(
+        name="zevtyardt_http",
+        urls=(
+            "https://raw.githubusercontent.com/zevtyardt/proxy-list/main/http.txt",
+        ),
+        scheme_hint="http",
+        priority=31,
+        max_items=2200,
+    ),
+    SourceSpec(
+        name="zevtyardt_socks4",
+        urls=(
+            "https://raw.githubusercontent.com/zevtyardt/proxy-list/main/socks4.txt",
+        ),
+        scheme_hint="socks4",
+        priority=31,
+        max_items=1800,
+    ),
+    SourceSpec(
+        name="zevtyardt_socks5",
+        urls=(
+            "https://raw.githubusercontent.com/zevtyardt/proxy-list/main/socks5.txt",
+        ),
+        scheme_hint="socks5",
+        priority=31,
+        max_items=1800,
+    ),
+    SourceSpec(
+        name="b4rcode_http",
+        urls=(
+            "https://raw.githubusercontent.com/B4RC0DE-TM/proxy-list/main/HTTP.txt",
+        ),
+        scheme_hint="http",
+        priority=31,
+        max_items=2200,
+    ),
+    SourceSpec(
+        name="b4rcode_socks4",
+        urls=(
+            "https://raw.githubusercontent.com/B4RC0DE-TM/proxy-list/main/SOCKS4.txt",
+        ),
+        scheme_hint="socks4",
+        priority=31,
+        max_items=1800,
+    ),
+    SourceSpec(
+        name="b4rcode_socks5",
+        urls=(
+            "https://raw.githubusercontent.com/B4RC0DE-TM/proxy-list/main/SOCKS5.txt",
+        ),
+        scheme_hint="socks5",
+        priority=31,
+        max_items=1700,
+    ),
+    SourceSpec(
+        name="mmpx12_http",
+        urls=(
+            "https://raw.githubusercontent.com/mmpx12/proxy-list/master/http.txt",
+        ),
+        scheme_hint="http",
+        priority=32,
+        max_items=1600,
+    ),
+    SourceSpec(
+        name="mmpx12_socks4",
+        urls=(
+            "https://raw.githubusercontent.com/mmpx12/proxy-list/master/socks4.txt",
+        ),
+        scheme_hint="socks4",
+        priority=32,
+        max_items=1600,
+    ),
+    SourceSpec(
+        name="mmpx12_socks5",
+        urls=(
+            "https://raw.githubusercontent.com/mmpx12/proxy-list/master/socks5.txt",
+        ),
+        scheme_hint="socks5",
+        priority=32,
+        max_items=1500,
+    ),
+    SourceSpec(
+        name="sunny9577_http",
+        urls=(
+            "https://raw.githubusercontent.com/sunny9577/proxy-scraper/refs/heads/master/generated/http_proxies.txt",
+        ),
+        scheme_hint="http",
+        priority=33,
+        max_items=2000,
+    ),
+    SourceSpec(
+        name="sunny9577_socks5",
+        urls=(
+            "https://raw.githubusercontent.com/sunny9577/proxy-scraper/refs/heads/master/generated/socks5_proxies.txt",
+        ),
+        scheme_hint="socks5",
+        priority=33,
+        max_items=1400,
+    ),
+    SourceSpec(
+        name="openproxylist_http",
+        urls=(
+            "https://api.openproxylist.xyz/http.txt",
+        ),
+        scheme_hint="http",
+        priority=34,
+        max_items=1800,
+    ),
+    SourceSpec(
+        name="openproxylist_socks4",
+        urls=(
+            "https://api.openproxylist.xyz/socks4.txt",
+        ),
+        scheme_hint="socks4",
+        priority=34,
+        max_items=1500,
+    ),
+    SourceSpec(
+        name="openproxylist_socks5",
+        urls=(
+            "https://api.openproxylist.xyz/socks5.txt",
+        ),
+        scheme_hint="socks5",
+        priority=34,
+        max_items=1500,
+    ),
+    SourceSpec(
+        name="clarketm_http_raw",
+        urls=(
+            "https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt",
+        ),
+        scheme_hint="http",
+        priority=35,
+        max_items=1600,
     ),
     SourceSpec(
         name="hookzof_socks5",
@@ -877,8 +1234,8 @@ def extract_ip(text: str) -> Optional[str]:
     return None
 
 
-# Stream and parse a text source without loading the whole response into memory.
-async def read_text_tokens(response, source: SourceSpec, per_source_limit: int) -> List[ProxyCandidate]:
+# Compute the effective parse cap for one source.
+def source_item_limit(source: SourceSpec, per_source_limit: int) -> int:
     limit = source.max_items or per_source_limit
     if source.max_items and per_source_limit > 0:
         limit = min(source.max_items, per_source_limit)
@@ -886,6 +1243,12 @@ async def read_text_tokens(response, source: SourceSpec, per_source_limit: int) 
         limit = per_source_limit
     if limit <= 0:
         limit = 1_000_000
+    return limit
+
+
+# Stream and parse a text source without loading the whole response into memory.
+async def read_text_tokens(response, source: SourceSpec, per_source_limit: int) -> List[ProxyCandidate]:
+    limit = source_item_limit(source, per_source_limit)
 
     found: List[ProxyCandidate] = []
     seen = set()
@@ -914,10 +1277,68 @@ async def read_text_tokens(response, source: SourceSpec, per_source_limit: int) 
     return found[:limit]
 
 
+# Parse only a small prefix used by source health checks.
+def parse_sample_candidates(text: str, source: SourceSpec, target_count: int) -> int:
+    if target_count <= 0:
+        target_count = 1
+    seen = set()
+    hits = 0
+    for token in TOKEN_SPLIT_RE.split(text):
+        candidate = parse_proxy_token(token, source)
+        if candidate is None or candidate.key in seen:
+            continue
+        seen.add(candidate.key)
+        hits += 1
+        if hits >= target_count:
+            return hits
+    return hits
+
+
+# Try one URL quickly before full source download.
+async def probe_source_url(
+    session,
+    source: SourceSpec,
+    url: str,
+    timeout_s: float,
+    sample_bytes: int,
+) -> Tuple[bool, Optional[str]]:
+    timeout = max(0.8, timeout_s)
+    bytes_to_read = max(1024, sample_bytes)
+    headers = {"Range": f"bytes=0-{bytes_to_read - 1}"}
+    try:
+        async with session.get(url, allow_redirects=True, timeout=timeout, headers=headers) as response:
+            if response.status >= 400:
+                return False, f"HTTP {response.status}"
+            sample = await response.content.read(bytes_to_read)
+            if not sample:
+                return False, "empty body"
+            text = sample.decode("utf-8", errors="ignore")
+            parsed = parse_sample_candidates(text, source, source.min_items)
+            if parsed < source.min_items:
+                return False, f"sample parsed {parsed}"
+            return True, None
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        return False, str(exc)
+
+
+# Pick URL order so a healthy mirror is tried first.
+def ordered_source_urls(source: SourceSpec, preferred_url: Optional[str] = None) -> Tuple[str, ...]:
+    if not preferred_url or preferred_url not in source.urls:
+        return source.urls
+    return (preferred_url,) + tuple(url for url in source.urls if url != preferred_url)
+
+
 # Fetch one source, trying every mirror until we get enough parsable data.
-async def fetch_one_source(session, source: SourceSpec, per_source_limit: int) -> Tuple[SourceResult, List[ProxyCandidate]]:
+async def fetch_one_source(
+    session,
+    source: SourceSpec,
+    per_source_limit: int,
+    preferred_url: Optional[str] = None,
+) -> Tuple[SourceResult, List[ProxyCandidate]]:
     last_error: Optional[str] = None
-    for url in source.urls:
+    for url in ordered_source_urls(source, preferred_url):
         try:
             async with session.get(url, allow_redirects=True) as response:
                 if response.status >= 400:
@@ -1021,6 +1442,7 @@ async def fetch_all_sources(args) -> Tuple[List[ProxyCandidate], List[SourceResu
 
     merged_candidates: Dict[Tuple[str, str, int, Optional[str], Optional[str]], ProxyCandidate] = {}
     results: List[SourceResult] = []
+    preferred_urls: Dict[str, str] = {}
 
     async with aiohttp.ClientSession(
         connector=connector,
@@ -1028,13 +1450,55 @@ async def fetch_all_sources(args) -> Tuple[List[ProxyCandidate], List[SourceResu
         headers=headers,
         trust_env=False,
     ) as session:
+        if not args.skip_source_health_check:
+            health_semaphore = asyncio.Semaphore(max(1, args.source_workers))
+
+            async def bounded_health(source: SourceSpec):
+                async with health_semaphore:
+                    last_error: Optional[str] = None
+                    for url in source.urls:
+                        ok, error = await probe_source_url(
+                            session=session,
+                            source=source,
+                            url=url,
+                            timeout_s=args.source_health_timeout,
+                            sample_bytes=args.source_health_bytes,
+                        )
+                        if ok:
+                            return source, url, None
+                        last_error = error
+                    return source, None, last_error or "health check failed"
+
+            health_rows = await asyncio.gather(
+                *(bounded_health(source) for source in ordered_sources),
+                return_exceptions=True,
+            )
+
+            healthy_sources: List[SourceSpec] = []
+            for source, row in zip(ordered_sources, health_rows):
+                if isinstance(row, Exception):
+                    results.append(SourceResult(source=source, count=0, error=f"health: {row}"))
+                    continue
+                _, preferred_url, error = row
+                if not preferred_url:
+                    results.append(SourceResult(source=source, count=0, error=f"health: {error}"))
+                    continue
+                preferred_urls[source.name] = preferred_url
+                healthy_sources.append(source)
+            ordered_sources = healthy_sources
+
         for start in range(0, len(ordered_sources), max(1, args.source_batch_size)):
             batch = ordered_sources[start : start + max(1, args.source_batch_size)]
             semaphore = asyncio.Semaphore(max(1, min(args.source_workers, len(batch))))
 
             async def bounded_fetch(source: SourceSpec):
                 async with semaphore:
-                    return await fetch_one_source(session, source, per_source_limit)
+                    return await fetch_one_source(
+                        session=session,
+                        source=source,
+                        per_source_limit=per_source_limit,
+                        preferred_url=preferred_urls.get(source.name),
+                    )
 
             gathered = await asyncio.gather(
                 *(bounded_fetch(source) for source in batch),
@@ -1100,7 +1564,7 @@ class SharedState:
         self.recent_tests: Deque[float] = deque(maxlen=512)
         self.seen_working = set()
         self.stop_event = asyncio.Event()
-        self.result_lock = asyncio.Lock()
+        self.save_lock = asyncio.Lock()
         self.started_at = time.time()
 
 
@@ -1139,8 +1603,8 @@ async def close_writer(writer) -> None:
         writer.close()
     wait_closed = getattr(writer, "wait_closed", None)
     if wait_closed is not None:
-        with suppress(Exception):
-            await wait_closed()
+        with suppress(Exception, asyncio.TimeoutError):
+            await asyncio.wait_for(wait_closed(), timeout=WRITER_CLOSE_TIMEOUT)
 
 
 # Return the remaining wall-clock budget for one in-flight network step.
@@ -1263,6 +1727,16 @@ def ip_check_deadline(timeout_s: float) -> float:
     return time.monotonic() + max(0.5, min(timeout_s + PROBE_DEADLINE_GRACE, STRICT_IP_TIMEOUT_CAP))
 
 
+# Bound every candidate with one hard deadline so late-stage workers cannot hang.
+def candidate_hard_timeout(args) -> float:
+    rounds = max(1, int(getattr(args, "stability_checks", 1)))
+    reachability_budget = rounds * max(0.35, float(args.timeout) + PROBE_DEADLINE_GRACE)
+    ip_budget = 0.0
+    if getattr(args, "require_different_ip", False):
+        ip_budget = max(0.5, min(float(args.timeout) + PROBE_DEADLINE_GRACE, STRICT_IP_TIMEOUT_CAP))
+    return max(0.8, reachability_budget + ip_budget + 0.25)
+
+
 # Probe multiple small URLs at once and stop on the first success.
 async def probe_reachability(
     AsyncProxy,
@@ -1272,6 +1746,25 @@ async def probe_reachability(
     timeout_s: float,
 ) -> bool:
     deadline = probe_deadline(timeout_s)
+
+    # Windows Proactor loop can emit overlapped-cancel noise when many pending
+    # probe tasks are cancelled. Sequential probing is slower but far more stable.
+    if os.name == "nt":
+        for target in targets:
+            if seconds_left(deadline) <= 0:
+                break
+            ok, _ = await request_via_proxy(
+                AsyncProxy=AsyncProxy,
+                candidate=candidate,
+                target=target,
+                deadline=deadline,
+                tls_context=tls_context,
+                body_limit=0,
+            )
+            if ok:
+                return True
+        return False
+
     tasks = {
         asyncio.create_task(
             request_via_proxy(
@@ -1305,7 +1798,11 @@ async def probe_reachability(
                     for other in pending:
                         other.cancel()
                     if pending:
-                        await asyncio.gather(*pending, return_exceptions=True)
+                        with suppress(asyncio.TimeoutError, asyncio.CancelledError):
+                            await asyncio.wait_for(
+                                asyncio.gather(*pending, return_exceptions=True),
+                                timeout=0.3,
+                            )
                     return True
         return False
     finally:
@@ -1313,19 +1810,28 @@ async def probe_reachability(
         for task in leftovers:
             task.cancel()
         if leftovers:
-            await asyncio.gather(*leftovers, return_exceptions=True)
+            with suppress(asyncio.TimeoutError, asyncio.CancelledError):
+                await asyncio.wait_for(
+                    asyncio.gather(*leftovers, return_exceptions=True),
+                    timeout=0.3,
+                )
 
 
 # Check one proxy against one or more small probe URLs.
 async def test_candidate(AsyncProxy, candidate: ProxyCandidate, args, baseline_ip: Optional[str], tls_context) -> bool:
-    if not await probe_reachability(
-        AsyncProxy=AsyncProxy,
-        candidate=candidate,
-        targets=args.probe_targets,
-        tls_context=tls_context,
-        timeout_s=args.timeout,
-    ):
-        return False
+    rounds = max(1, int(args.stability_checks))
+    for idx in range(rounds):
+        round_timeout = args.timeout
+        if idx > 0:
+            round_timeout = max(0.35, args.timeout * args.stability_timeout_factor)
+        if not await probe_reachability(
+            AsyncProxy=AsyncProxy,
+            candidate=candidate,
+            targets=args.probe_targets,
+            tls_context=tls_context,
+            timeout_s=round_timeout,
+        ):
+            return False
 
     if args.require_different_ip:
         if not baseline_ip:
@@ -1372,13 +1878,11 @@ def status_line(state: SharedState, total: int) -> str:
 # Refresh the status line until workers finish.
 async def progress_loop(state: SharedState, total: int) -> None:
     while not state.stop_event.is_set():
-        async with state.result_lock:
-            line = status_line(state, total)
+        line = status_line(state, total)
         print("\r" + line + " " * 10, end="", file=sys.stderr, flush=True)
         await asyncio.sleep(0.25)
 
-    async with state.result_lock:
-        line = status_line(state, total)
+    line = status_line(state, total)
     print("\r" + line + " " * 10, file=sys.stderr, flush=True)
 
 
@@ -1391,6 +1895,7 @@ async def worker_loop(
     baseline_ip: Optional[str],
     tls_context: ssl.SSLContext,
     writer: ResultWriter,
+    hard_timeout_s: float,
 ) -> None:
     while not state.stop_event.is_set():
         try:
@@ -1398,38 +1903,37 @@ async def worker_loop(
         except asyncio.QueueEmpty:
             return
 
-        async with state.result_lock:
-            state.active += 1
+        state.active += 1
 
         try:
-            ok = await test_candidate(AsyncProxy, candidate, args, baseline_ip, tls_context)
+            ok = await asyncio.wait_for(
+                test_candidate(AsyncProxy, candidate, args, baseline_ip, tls_context),
+                timeout=hard_timeout_s,
+            )
         except asyncio.CancelledError:
-            async with state.result_lock:
-                state.active = max(0, state.active - 1)
+            state.active = max(0, state.active - 1)
             raise
         except Exception:
             ok = False
 
-        async with state.result_lock:
-            state.active = max(0, state.active - 1)
-            state.tested += 1
-            state.recent_tests.append(time.monotonic())
-            if not ok:
-                continue
+        state.active = max(0, state.active - 1)
+        state.tested += 1
+        state.recent_tests.append(time.monotonic())
+        if not ok:
+            continue
 
-            proxy_url = candidate.proxy_url
+        proxy_url = candidate.proxy_url
+        async with state.save_lock:
             if proxy_url in state.seen_working:
                 continue
             if state.found >= state.need:
                 state.stop_event.set()
                 return
-
             wrote = writer.write_line(proxy_url)
+            state.seen_working.add(proxy_url)
             if not wrote:
-                state.seen_working.add(proxy_url)
                 continue
 
-            state.seen_working.add(proxy_url)
             state.found += 1
             if state.found >= state.need:
                 state.stop_event.set()
@@ -1477,10 +1981,20 @@ async def run_checks(candidates: Sequence[ProxyCandidate], args) -> Tuple[int, i
                     )
                     args.require_different_ip = False
 
+            hard_timeout_s = candidate_hard_timeout(args)
             progress_task = asyncio.create_task(progress_loop(state, len(candidates)))
             workers = [
                 asyncio.create_task(
-                    worker_loop(state, queue, AsyncProxy, args, baseline_ip, tls_context, writer)
+                    worker_loop(
+                        state,
+                        queue,
+                        AsyncProxy,
+                        args,
+                        baseline_ip,
+                        tls_context,
+                        writer,
+                        hard_timeout_s,
+                    )
                 )
                 for _ in range(max(1, args.workers))
             ]
@@ -1493,9 +2007,21 @@ async def run_checks(candidates: Sequence[ProxyCandidate], args) -> Tuple[int, i
                     return_when=asyncio.FIRST_COMPLETED,
                 )
                 if stop_waiter in done and not gather_future.done():
-                    for task in workers:
-                        task.cancel()
-                    await asyncio.gather(*workers, return_exceptions=True)
+                    # Two-phase tail shutdown: tiny grace period then hard cancel.
+                    grace = min(0.2, max(0.05, args.tail_drain_timeout * 0.25))
+                    with suppress(asyncio.TimeoutError, asyncio.CancelledError):
+                        await asyncio.wait_for(
+                            gather_future,
+                            timeout=grace,
+                        )
+                    if not gather_future.done():
+                        for task in workers:
+                            task.cancel()
+                        with suppress(asyncio.TimeoutError, asyncio.CancelledError):
+                            await asyncio.wait_for(
+                                asyncio.gather(*workers, return_exceptions=True),
+                                timeout=args.tail_drain_timeout,
+                            )
                 else:
                     state.stop_event.set()
                     await gather_future
@@ -1504,6 +2030,14 @@ async def run_checks(candidates: Sequence[ProxyCandidate], args) -> Tuple[int, i
                 if not stop_waiter.done():
                     stop_waiter.cancel()
                     await asyncio.gather(stop_waiter, return_exceptions=True)
+                if not gather_future.done():
+                    for task in workers:
+                        task.cancel()
+                    with suppress(asyncio.TimeoutError, asyncio.CancelledError):
+                        await asyncio.wait_for(
+                            asyncio.gather(*workers, return_exceptions=True),
+                            timeout=max(0.2, args.tail_drain_timeout),
+                        )
                 await asyncio.gather(progress_task, return_exceptions=True)
 
     elapsed = time.time() - state.started_at
@@ -1589,6 +2123,30 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Per-proxy timeout in seconds (default: {DEFAULT_TIMEOUT}).",
     )
     ap.add_argument(
+        "--stability-checks",
+        type=int,
+        default=DEFAULT_STABILITY_CHECKS,
+        help=f"How many successful reachability rounds a proxy must pass (default: {DEFAULT_STABILITY_CHECKS}).",
+    )
+    ap.add_argument(
+        "--stability-timeout-factor",
+        type=float,
+        default=DEFAULT_STABILITY_TIMEOUT_FACTOR,
+        help=(
+            "Timeout multiplier used for extra stability rounds after the first success "
+            f"(default: {DEFAULT_STABILITY_TIMEOUT_FACTOR})."
+        ),
+    )
+    ap.add_argument(
+        "--tail-drain-timeout",
+        type=float,
+        default=DEFAULT_TAIL_DRAIN_TIMEOUT,
+        help=(
+            "Max seconds to wait for worker cancellation after stop condition is reached "
+            f"(default: {DEFAULT_TAIL_DRAIN_TIMEOUT})."
+        ),
+    )
+    ap.add_argument(
         "--test-url",
         action="append",
         dest="test_urls",
@@ -1617,6 +2175,18 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Timeout for source downloads (default: {DEFAULT_SOURCE_TIMEOUT}).",
     )
     ap.add_argument(
+        "--source-health-timeout",
+        type=float,
+        default=DEFAULT_SOURCE_HEALTH_TIMEOUT,
+        help=f"Timeout for source health pre-check requests (default: {DEFAULT_SOURCE_HEALTH_TIMEOUT}).",
+    )
+    ap.add_argument(
+        "--source-health-bytes",
+        type=int,
+        default=DEFAULT_SOURCE_HEALTH_BYTES,
+        help=f"How many bytes to sample while validating each source (default: {DEFAULT_SOURCE_HEALTH_BYTES}).",
+    )
+    ap.add_argument(
         "--source-workers",
         type=int,
         default=DEFAULT_SOURCE_WORKERS,
@@ -1633,6 +2203,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=DEFAULT_PER_SOURCE_LIMIT,
         help="Max parsed proxies per source. 0 = automatic.",
+    )
+    ap.add_argument(
+        "--skip-source-health-check",
+        action="store_true",
+        help="Skip lightweight source health checks before full downloads.",
     )
     ap.add_argument(
         "--list-sources",
@@ -1660,7 +2235,14 @@ async def async_main(args) -> int:
         file=sys.stderr,
     )
     print(
-        f"tested={tested:,} | workers={args.workers} | timeout={args.timeout}s | elapsed={elapsed:.2f}s",
+        "tested={tested:,} | workers={workers} | timeout={timeout}s | "
+        "stability_checks={stability} | elapsed={elapsed:.2f}s".format(
+            tested=tested,
+            workers=args.workers,
+            timeout=args.timeout,
+            stability=args.stability_checks,
+            elapsed=elapsed,
+        ),
         file=sys.stderr,
     )
     if baseline_ip:
@@ -1686,6 +2268,12 @@ def main() -> int:
 
     args.workers = max(1, int(args.workers))
     args.timeout = max(0.5, float(args.timeout))
+    args.stability_checks = max(1, int(args.stability_checks))
+    args.stability_timeout_factor = min(1.0, max(0.2, float(args.stability_timeout_factor)))
+    args.tail_drain_timeout = max(0.2, min(5.0, float(args.tail_drain_timeout)))
+    args.source_timeout = max(1.0, float(args.source_timeout))
+    args.source_health_timeout = max(0.8, min(args.source_timeout, float(args.source_health_timeout)))
+    args.source_health_bytes = max(1024, int(args.source_health_bytes))
     args.source_workers = max(1, int(args.source_workers))
     args.source_batch_size = max(1, int(args.source_batch_size))
     args.per_source_limit = int(args.per_source_limit)
