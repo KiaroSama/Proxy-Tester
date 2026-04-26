@@ -59,9 +59,6 @@ DEFAULT_TAIL_EMPTY_TIMEOUT = 0.0
 WRITER_CLOSE_TIMEOUT = 0.25
 DEFAULT_TEST_URLS: Tuple[str, ...] = (
     "http://www.gstatic.com/generate_204",
-    "http://cp.cloudflare.com/generate_204",
-    "https://www.gstatic.com/generate_204",
-    "https://cp.cloudflare.com/generate_204",
 )
 DEFAULT_IP_URL = "https://api.ipify.org?format=json"
 SCHEME_ORDER: Tuple[str, ...] = ("http", "socks5", "socks4")
@@ -75,7 +72,7 @@ HOSTNAME_RE = re.compile(
 def default_worker_count() -> int:
     """Pick a balanced async worker count for typical desktop/server machines."""
     cpu = os.cpu_count() or 4
-    return max(300, min(900, cpu * 90))
+    return max(500, min(1400, cpu * 140))
 
 
 DEFAULT_WORKERS = default_worker_count()
@@ -129,6 +126,7 @@ class ProbeTarget:
     host: str
     port: int
     path_qs: str
+    expected_status: Optional[int] = None
 
 
 @dataclass
@@ -1516,6 +1514,12 @@ def order_candidates(candidates: Sequence[ProxyCandidate]) -> List[ProxyCandidat
 
 
 # Build parsed targets once for all workers.
+def expected_probe_status(split) -> Optional[int]:
+    if (split.path or "").rstrip("/") == "/generate_204":
+        return 204
+    return None
+
+
 def build_probe_targets(urls: Sequence[str]) -> List[ProbeTarget]:
     targets: List[ProbeTarget] = []
     for raw_url in urls:
@@ -1535,6 +1539,7 @@ def build_probe_targets(urls: Sequence[str]) -> List[ProbeTarget]:
                 host=host,
                 port=port,
                 path_qs=path_qs,
+                expected_status=expected_probe_status(split),
             )
         )
     return targets
@@ -1788,6 +1793,14 @@ def proxy_auth_header(candidate: ProxyCandidate) -> str:
     return f"Proxy-Authorization: Basic {token}\r\n"
 
 
+def response_status_ok(target: ProbeTarget, status: Optional[int]) -> bool:
+    if status is None:
+        return False
+    if target.expected_status is not None:
+        return status == target.expected_status
+    return 200 <= status < 400
+
+
 async def request_via_plain_http_proxy(
     candidate: ProxyCandidate,
     target: ProbeTarget,
@@ -1821,7 +1834,7 @@ async def request_via_plain_http_proxy(
         await asyncio.wait_for(writer.drain(), timeout=remaining)
 
         status, body = await read_http_response(reader, deadline, body_limit=body_limit)
-        if status is None or status >= 400:
+        if not response_status_ok(target, status):
             return False, None
         return True, body
     except Exception:
@@ -1886,7 +1899,7 @@ async def request_via_proxy(
         await asyncio.wait_for(writer.drain(), timeout=remaining)
 
         status, body = await read_http_response(reader, deadline, body_limit=body_limit)
-        if status is None or status >= 400:
+        if not response_status_ok(target, status):
             return False, None
         return True, body
     except Exception:
