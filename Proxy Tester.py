@@ -70,9 +70,8 @@ HOSTNAME_RE = re.compile(
 
 
 def default_worker_count() -> int:
-    """Pick a balanced async worker count for typical desktop/server machines."""
-    cpu = os.cpu_count() or 4
-    return max(500, min(1400, cpu * 140))
+    """Use aggressive concurrency for large public proxy batches."""
+    return 3000
 
 
 DEFAULT_WORKERS = default_worker_count()
