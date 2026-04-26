@@ -11,6 +11,7 @@ Highlights:
 - saves each working proxy as soon as it is found
 - stops exactly at the requested number of saved proxies
 - runs repeat reachability checks for more reliable working proxies
+- trims the slow tail of hanging candidates once the queue is empty
 - prefers high-confidence, actively maintained proxy sources
 - prints colorized progress in the terminal
 """
@@ -53,6 +54,7 @@ STRICT_IP_TIMEOUT_CAP = 1.5
 DEFAULT_STABILITY_CHECKS = 2
 DEFAULT_STABILITY_TIMEOUT_FACTOR = 0.8
 DEFAULT_TAIL_DRAIN_TIMEOUT = 0.9
+DEFAULT_TAIL_EMPTY_TIMEOUT = 1.25
 WRITER_CLOSE_TIMEOUT = 0.25
 DEFAULT_TEST_URLS: Tuple[str, ...] = (
     "https://www.gstatic.com/generate_204",
@@ -937,6 +939,15 @@ SOURCES: Tuple[SourceSpec, ...] = (
         max_items=2000,
     ),
     SourceSpec(
+        name="sunny9577_socks4",
+        urls=(
+            "https://raw.githubusercontent.com/sunny9577/proxy-scraper/refs/heads/master/generated/socks4_proxies.txt",
+        ),
+        scheme_hint="socks4",
+        priority=33,
+        max_items=1400,
+    ),
+    SourceSpec(
         name="sunny9577_socks5",
         urls=(
             "https://raw.githubusercontent.com/sunny9577/proxy-scraper/refs/heads/master/generated/socks5_proxies.txt",
@@ -989,6 +1000,124 @@ SOURCES: Tuple[SourceSpec, ...] = (
         scheme_hint="socks5",
         priority=30,
         max_items=1200,
+    ),
+    # Extra lower-priority public repositories for fallback coverage.
+    SourceSpec(
+        name="kangproxy_http",
+        urls=(
+            "https://raw.githubusercontent.com/officialputuid/KangProxy/KangProxy/http/http.txt",
+        ),
+        scheme_hint="http",
+        priority=36,
+        max_items=1800,
+    ),
+    SourceSpec(
+        name="kangproxy_https",
+        urls=(
+            "https://raw.githubusercontent.com/officialputuid/KangProxy/KangProxy/https/https.txt",
+        ),
+        scheme_hint="http",
+        priority=36,
+        max_items=1600,
+    ),
+    SourceSpec(
+        name="kangproxy_socks4",
+        urls=(
+            "https://raw.githubusercontent.com/officialputuid/KangProxy/KangProxy/socks4/socks4.txt",
+        ),
+        scheme_hint="socks4",
+        priority=36,
+        max_items=1400,
+    ),
+    SourceSpec(
+        name="kangproxy_socks5",
+        urls=(
+            "https://raw.githubusercontent.com/officialputuid/KangProxy/KangProxy/socks5/socks5.txt",
+        ),
+        scheme_hint="socks5",
+        priority=36,
+        max_items=1400,
+    ),
+    SourceSpec(
+        name="prxchk_http",
+        urls=(
+            "https://raw.githubusercontent.com/prxchk/proxy-list/main/http.txt",
+        ),
+        scheme_hint="http",
+        priority=37,
+        max_items=1800,
+    ),
+    SourceSpec(
+        name="prxchk_socks4",
+        urls=(
+            "https://raw.githubusercontent.com/prxchk/proxy-list/main/socks4.txt",
+        ),
+        scheme_hint="socks4",
+        priority=37,
+        max_items=1400,
+    ),
+    SourceSpec(
+        name="prxchk_socks5",
+        urls=(
+            "https://raw.githubusercontent.com/prxchk/proxy-list/main/socks5.txt",
+        ),
+        scheme_hint="socks5",
+        priority=37,
+        max_items=1400,
+    ),
+    SourceSpec(
+        name="yemixzy_http",
+        urls=(
+            "https://raw.githubusercontent.com/yemixzy/proxy-list/main/proxies/http.txt",
+        ),
+        scheme_hint="http",
+        priority=38,
+        max_items=1200,
+    ),
+    SourceSpec(
+        name="yemixzy_socks4",
+        urls=(
+            "https://raw.githubusercontent.com/yemixzy/proxy-list/main/proxies/socks4.txt",
+        ),
+        scheme_hint="socks4",
+        priority=38,
+        max_items=800,
+    ),
+    SourceSpec(
+        name="yemixzy_socks5",
+        urls=(
+            "https://raw.githubusercontent.com/yemixzy/proxy-list/main/proxies/socks5.txt",
+        ),
+        scheme_hint="socks5",
+        priority=38,
+        max_items=800,
+    ),
+    SourceSpec(
+        name="casals_http",
+        urls=(
+            "https://raw.githubusercontent.com/casa-ls/proxy-list/main/http",
+        ),
+        scheme_hint="http",
+        priority=39,
+        max_items=2200,
+    ),
+    SourceSpec(
+        name="casals_socks4",
+        urls=(
+            "https://raw.githubusercontent.com/casa-ls/proxy-list/main/socks4",
+        ),
+        scheme_hint="socks4",
+        priority=39,
+        max_items=1400,
+    ),
+    SourceSpec(
+        name="casals_socks5",
+        urls=(
+            "https://raw.githubusercontent.com/casa-ls/proxy-list/main/socks5",
+        ),
+        scheme_hint="socks5",
+        priority=39,
+        max_items=1400,
     ),
 )
 
@@ -1886,6 +2015,30 @@ async def progress_loop(state: SharedState, total: int) -> None:
     print("\r" + line + " " * 10, file=sys.stderr, flush=True)
 
 
+async def empty_queue_tail_watch(
+    state: SharedState,
+    queue: "asyncio.Queue[ProxyCandidate]",
+    tail_timeout_s: float,
+) -> None:
+    """Stop the run when only the slow final stragglers remain."""
+    if tail_timeout_s <= 0:
+        return
+
+    empty_since: Optional[float] = None
+    while not state.stop_event.is_set():
+        if queue.empty():
+            if state.active <= 0:
+                return
+            if empty_since is None:
+                empty_since = time.monotonic()
+            elif time.monotonic() - empty_since >= tail_timeout_s:
+                state.stop_event.set()
+                return
+        else:
+            empty_since = None
+        await asyncio.sleep(0.05)
+
+
 # Pull one candidate at a time from the queue and test it.
 async def worker_loop(
     state: SharedState,
@@ -1982,7 +2135,11 @@ async def run_checks(candidates: Sequence[ProxyCandidate], args) -> Tuple[int, i
                     args.require_different_ip = False
 
             hard_timeout_s = candidate_hard_timeout(args)
+            worker_count = max(1, min(args.workers, len(candidates)))
             progress_task = asyncio.create_task(progress_loop(state, len(candidates)))
+            empty_tail_task = asyncio.create_task(
+                empty_queue_tail_watch(state, queue, args.tail_empty_timeout)
+            )
             workers = [
                 asyncio.create_task(
                     worker_loop(
@@ -1996,7 +2153,7 @@ async def run_checks(candidates: Sequence[ProxyCandidate], args) -> Tuple[int, i
                         hard_timeout_s,
                     )
                 )
-                for _ in range(max(1, args.workers))
+                for _ in range(worker_count)
             ]
             gather_future = asyncio.gather(*workers, return_exceptions=True)
             stop_waiter = asyncio.create_task(state.stop_event.wait())
@@ -2030,6 +2187,9 @@ async def run_checks(candidates: Sequence[ProxyCandidate], args) -> Tuple[int, i
                 if not stop_waiter.done():
                     stop_waiter.cancel()
                     await asyncio.gather(stop_waiter, return_exceptions=True)
+                if not empty_tail_task.done():
+                    empty_tail_task.cancel()
+                    await asyncio.gather(empty_tail_task, return_exceptions=True)
                 if not gather_future.done():
                     for task in workers:
                         task.cancel()
@@ -2144,6 +2304,16 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Max seconds to wait for worker cancellation after stop condition is reached "
             f"(default: {DEFAULT_TAIL_DRAIN_TIMEOUT})."
+        ),
+    )
+    ap.add_argument(
+        "--tail-empty-timeout",
+        type=float,
+        default=DEFAULT_TAIL_EMPTY_TIMEOUT,
+        help=(
+            "Seconds to keep the last active checks after the candidate queue is empty. "
+            "Use 0 to wait for every candidate "
+            f"(default: {DEFAULT_TAIL_EMPTY_TIMEOUT})."
         ),
     )
     ap.add_argument(
@@ -2271,6 +2441,7 @@ def main() -> int:
     args.stability_checks = max(1, int(args.stability_checks))
     args.stability_timeout_factor = min(1.0, max(0.2, float(args.stability_timeout_factor)))
     args.tail_drain_timeout = max(0.2, min(5.0, float(args.tail_drain_timeout)))
+    args.tail_empty_timeout = max(0.0, min(30.0, float(args.tail_empty_timeout)))
     args.source_timeout = max(1.0, float(args.source_timeout))
     args.source_health_timeout = max(0.8, min(args.source_timeout, float(args.source_health_timeout)))
     args.source_health_bytes = max(1024, int(args.source_health_bytes))
