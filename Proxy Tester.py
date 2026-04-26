@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import importlib
 import ipaddress
 import json
@@ -51,12 +52,14 @@ DEFAULT_CANDIDATE_MULTIPLIER = 60
 RECENT_RATE_WINDOW = 4.0
 PROBE_DEADLINE_GRACE = 0.15
 STRICT_IP_TIMEOUT_CAP = 1.5
-DEFAULT_STABILITY_CHECKS = 2
+DEFAULT_STABILITY_CHECKS = 1
 DEFAULT_STABILITY_TIMEOUT_FACTOR = 0.8
 DEFAULT_TAIL_DRAIN_TIMEOUT = 0.9
 DEFAULT_TAIL_EMPTY_TIMEOUT = 0.0
 WRITER_CLOSE_TIMEOUT = 0.25
 DEFAULT_TEST_URLS: Tuple[str, ...] = (
+    "http://www.gstatic.com/generate_204",
+    "http://cp.cloudflare.com/generate_204",
     "https://www.gstatic.com/generate_204",
     "https://cp.cloudflare.com/generate_204",
 )
@@ -72,7 +75,7 @@ HOSTNAME_RE = re.compile(
 def default_worker_count() -> int:
     """Pick a balanced async worker count for typical desktop/server machines."""
     cpu = os.cpu_count() or 4
-    return max(400, min(2200, cpu * 220))
+    return max(300, min(900, cpu * 90))
 
 
 DEFAULT_WORKERS = default_worker_count()
@@ -1769,6 +1772,64 @@ async def read_http_response(reader, deadline: float, body_limit: int = 0) -> Tu
     return status, body.decode("utf-8", errors="ignore")
 
 
+def http_proxy_target_url(target: ProbeTarget) -> str:
+    """Build the absolute-form URL required by plain HTTP proxy requests."""
+    default_port = 443 if target.scheme == "https" else 80
+    port = "" if target.port == default_port else f":{target.port}"
+    return f"{target.scheme}://{format_host(target.host)}{port}{target.path_qs}"
+
+
+def proxy_auth_header(candidate: ProxyCandidate) -> str:
+    if candidate.username is None:
+        return ""
+    password = candidate.password or ""
+    raw = f"{candidate.username}:{password}".encode("utf-8", errors="ignore")
+    token = base64.b64encode(raw).decode("ascii")
+    return f"Proxy-Authorization: Basic {token}\r\n"
+
+
+async def request_via_plain_http_proxy(
+    candidate: ProxyCandidate,
+    target: ProbeTarget,
+    deadline: float,
+    body_limit: int = 0,
+) -> Tuple[bool, Optional[str]]:
+    """Check HTTP proxies using normal absolute-form HTTP requests."""
+    writer = None
+    try:
+        remaining = seconds_left(deadline)
+        if remaining <= 0:
+            return False, None
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(candidate.host, candidate.port),
+            timeout=remaining,
+        )
+
+        request = (
+            f"GET {http_proxy_target_url(target)} HTTP/1.1\r\n"
+            f"Host: {target.host}\r\n"
+            f"{proxy_auth_header(candidate)}"
+            f"User-Agent: {USER_AGENT}\r\n"
+            "Accept: */*\r\n"
+            "Connection: close\r\n\r\n"
+        ).encode("ascii", errors="ignore")
+        writer.write(request)
+
+        remaining = seconds_left(deadline)
+        if remaining <= 0:
+            return False, None
+        await asyncio.wait_for(writer.drain(), timeout=remaining)
+
+        status, body = await read_http_response(reader, deadline, body_limit=body_limit)
+        if status is None or status >= 400:
+            return False, None
+        return True, body
+    except Exception:
+        return False, None
+    finally:
+        await close_writer(writer)
+
+
 # Send one lightweight HTTP request through a proxy tunnel.
 async def request_via_proxy(
     AsyncProxy,
@@ -1778,11 +1839,19 @@ async def request_via_proxy(
     tls_context: ssl.SSLContext,
     body_limit: int = 0,
 ) -> Tuple[bool, Optional[str]]:
-    proxy = AsyncProxy.from_url(candidate.proxy_url)
     sock = None
     writer = None
 
+    if candidate.scheme == "http" and target.scheme == "http":
+        return await request_via_plain_http_proxy(
+            candidate=candidate,
+            target=target,
+            deadline=deadline,
+            body_limit=body_limit,
+        )
+
     try:
+        proxy = AsyncProxy.from_url(candidate.proxy_url)
         remaining = seconds_left(deadline)
         if remaining <= 0:
             return False, None
