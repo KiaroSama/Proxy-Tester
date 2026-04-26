@@ -54,7 +54,7 @@ STRICT_IP_TIMEOUT_CAP = 1.5
 DEFAULT_STABILITY_CHECKS = 2
 DEFAULT_STABILITY_TIMEOUT_FACTOR = 0.8
 DEFAULT_TAIL_DRAIN_TIMEOUT = 0.9
-DEFAULT_TAIL_EMPTY_TIMEOUT = 1.25
+DEFAULT_TAIL_EMPTY_TIMEOUT = 0.0
 WRITER_CLOSE_TIMEOUT = 0.25
 DEFAULT_TEST_URLS: Tuple[str, ...] = (
     "https://www.gstatic.com/generate_204",
@@ -1003,40 +1003,40 @@ SOURCES: Tuple[SourceSpec, ...] = (
     ),
     # Extra lower-priority public repositories for fallback coverage.
     SourceSpec(
-        name="kangproxy_http",
+        name="gfpcom_http",
         urls=(
-            "https://raw.githubusercontent.com/officialputuid/KangProxy/KangProxy/http/http.txt",
+            "https://raw.githubusercontent.com/wiki/gfpcom/free-proxy-list/lists/http.txt",
         ),
         scheme_hint="http",
         priority=36,
-        max_items=1800,
+        max_items=2500,
     ),
     SourceSpec(
-        name="kangproxy_https",
+        name="gfpcom_https",
         urls=(
-            "https://raw.githubusercontent.com/officialputuid/KangProxy/KangProxy/https/https.txt",
+            "https://raw.githubusercontent.com/wiki/gfpcom/free-proxy-list/lists/https.txt",
         ),
         scheme_hint="http",
         priority=36,
-        max_items=1600,
+        max_items=2200,
     ),
     SourceSpec(
-        name="kangproxy_socks4",
+        name="gfpcom_socks4",
         urls=(
-            "https://raw.githubusercontent.com/officialputuid/KangProxy/KangProxy/socks4/socks4.txt",
+            "https://raw.githubusercontent.com/wiki/gfpcom/free-proxy-list/lists/socks4.txt",
         ),
         scheme_hint="socks4",
         priority=36,
-        max_items=1400,
+        max_items=2200,
     ),
     SourceSpec(
-        name="kangproxy_socks5",
+        name="gfpcom_socks5",
         urls=(
-            "https://raw.githubusercontent.com/officialputuid/KangProxy/KangProxy/socks5/socks5.txt",
+            "https://raw.githubusercontent.com/wiki/gfpcom/free-proxy-list/lists/socks5.txt",
         ),
         scheme_hint="socks5",
         priority=36,
-        max_items=1400,
+        max_items=2200,
     ),
     SourceSpec(
         name="prxchk_http",
@@ -1064,33 +1064,6 @@ SOURCES: Tuple[SourceSpec, ...] = (
         scheme_hint="socks5",
         priority=37,
         max_items=1400,
-    ),
-    SourceSpec(
-        name="yemixzy_http",
-        urls=(
-            "https://raw.githubusercontent.com/yemixzy/proxy-list/main/proxies/http.txt",
-        ),
-        scheme_hint="http",
-        priority=38,
-        max_items=1200,
-    ),
-    SourceSpec(
-        name="yemixzy_socks4",
-        urls=(
-            "https://raw.githubusercontent.com/yemixzy/proxy-list/main/proxies/socks4.txt",
-        ),
-        scheme_hint="socks4",
-        priority=38,
-        max_items=800,
-    ),
-    SourceSpec(
-        name="yemixzy_socks5",
-        urls=(
-            "https://raw.githubusercontent.com/yemixzy/proxy-list/main/proxies/socks5.txt",
-        ),
-        scheme_hint="socks5",
-        priority=38,
-        max_items=800,
     ),
     SourceSpec(
         name="casals_http",
@@ -1221,6 +1194,16 @@ def normalize_host(host: str) -> Optional[str]:
     host = host.strip().strip("[]").lower().rstrip(".")
     if not host:
         return None
+
+    if IPV4_LIKE_RE.fullmatch(host):
+        parts = host.split(".")
+        octets: List[str] = []
+        for part in parts:
+            value = int(part)
+            if value > 255:
+                return None
+            octets.append(str(value))
+        return ".".join(octets)
 
     try:
         return str(ipaddress.ip_address(host))
@@ -2011,9 +1994,6 @@ async def progress_loop(state: SharedState, total: int) -> None:
         print("\r" + line + " " * 10, end="", file=sys.stderr, flush=True)
         await asyncio.sleep(0.25)
 
-    line = status_line(state, total)
-    print("\r" + line + " " * 10, file=sys.stderr, flush=True)
-
 
 async def empty_queue_tail_watch(
     state: SharedState,
@@ -2198,7 +2178,14 @@ async def run_checks(candidates: Sequence[ProxyCandidate], args) -> Tuple[int, i
                             asyncio.gather(*workers, return_exceptions=True),
                             timeout=max(0.2, args.tail_drain_timeout),
                         )
-                await asyncio.gather(progress_task, return_exceptions=True)
+                state.active = 0
+                state.stop_event.set()
+                with suppress(asyncio.TimeoutError, asyncio.CancelledError):
+                    await asyncio.wait_for(progress_task, timeout=0.5)
+                if not progress_task.done():
+                    progress_task.cancel()
+                    await asyncio.gather(progress_task, return_exceptions=True)
+                print("\r" + status_line(state, len(candidates)) + " " * 10, file=sys.stderr, flush=True)
 
     elapsed = time.time() - state.started_at
     return state.tested, state.found, elapsed, baseline_ip
@@ -2248,8 +2235,11 @@ def print_source_summary(results: Iterable[SourceResult], total_unique: int) -> 
         )
         print(f"top sources: {top}", file=sys.stderr)
     if failed_rows:
-        failed_preview = ", ".join(item.source.name for item in failed_rows[:6])
-        print(f"failed/skipped: {failed_preview}", file=sys.stderr)
+        failed_preview = ", ".join(item.source.name for item in failed_rows[:10])
+        more = ""
+        if len(failed_rows) > 10:
+            more = f", +{len(failed_rows) - 10} more"
+        print(f"failed/skipped ({len(failed_rows)}): {failed_preview}{more}", file=sys.stderr)
 
 
 # Print the built-in source catalog and exit.
@@ -2311,8 +2301,8 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=DEFAULT_TAIL_EMPTY_TIMEOUT,
         help=(
-            "Seconds to keep the last active checks after the candidate queue is empty. "
-            "Use 0 to wait for every candidate "
+            "Optional seconds to keep the last active checks after the candidate queue is empty. "
+            "0 waits for every candidate "
             f"(default: {DEFAULT_TAIL_EMPTY_TIMEOUT})."
         ),
     )
@@ -2417,6 +2407,24 @@ async def async_main(args) -> int:
     )
     if baseline_ip:
         print(f"baseline_ip={baseline_ip}", file=sys.stderr)
+    if found < args.need:
+        if tested >= len(candidates):
+            print(
+                paint(
+                    f"Warning: only {found} working proxies were found after checking all {len(candidates):,} candidates.",
+                    Ansi.YELLOW,
+                ),
+                file=sys.stderr,
+            )
+        else:
+            print(
+                paint(
+                    f"Warning: stopped after {tested:,}/{len(candidates):,} candidates. "
+                    "Use --tail-empty-timeout 0 for a complete check.",
+                    Ansi.YELLOW,
+                ),
+                file=sys.stderr,
+            )
     return 0
 
 
