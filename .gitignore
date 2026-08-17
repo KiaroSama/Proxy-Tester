@@ -64,3 +64,12 @@ graphify-out/
 .env
 .env.*
 !.env.example
+
+# Hook Maker: local/private files (auto-managed)
+/graphify-out/
+/.env
+/.env.*
+!/.env.example
+!/.env.sample
+!/.env.template
+!/.env.dist
