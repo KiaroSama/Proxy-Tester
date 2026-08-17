@@ -1,0 +1,66 @@
+SPDX-License-Identifier: LicenseRef-Proprietary
+
+PROPRIETARY SOFTWARE LICENSE
+
+Copyright (c) 2026 KiaroSama. All Rights Reserved.
+
+NOTE ON AUTOMATED LICENSE DETECTION
+GitHub identifies a licence by matching this file against a fixed corpus of
+standard open-source licences (MIT, Apache-2.0, GPL, ...). This is a custom
+proprietary licence, so no match is possible and GitHub will show a plain
+"View license" link rather than a named licence badge. That is expected, not a
+misconfiguration: making the badge appear would require replacing the text
+below with a standard open-source licence, which would grant the public rights
+this licence deliberately withholds. The SPDX line above is the machine-readable
+marker for a non-standard licence (LicenseRef-*).
+
+This software and its associated source code, documentation, configuration,
+scripts, tests, and any other files contained in this repository (collectively,
+the "Software") are the proprietary and confidential property of the copyright
+holder.
+
+NO LICENSE GRANTED
+
+No license, express or implied, by estoppel or otherwise, is granted to you
+under any patent, copyright, trademark, trade secret, or other intellectual
+property right of the copyright holder.
+
+PROHIBITED ACTIONS
+
+Without the prior written permission of the copyright holder, you may NOT:
+
+1. Copy, modify, merge, or create derivative works of the Software.
+2. Distribute, publish, sublicense, or sell copies of the Software.
+3. Use the Software for commercial or non-commercial purposes.
+4. Reverse engineer, decompile, or disassemble the Software, except to the
+   extent expressly permitted by applicable law.
+5. Remove or alter any proprietary notices, labels, or marks.
+6. Use the Software to develop a competing product.
+7. Disclose, share, or transmit the Software to any third party.
+
+PERMITTED VIEWING
+
+If you have been granted access to view this repository, that access is limited
+to viewing only. It does not constitute a license to use, copy, or distribute
+the Software in any form.
+
+THIRD-PARTY SERVICES AND DATA
+
+The Software retrieves proxy lists from third-party public sources. Those
+sources, their contents, and the proxy servers they list are not owned or
+controlled by the copyright holder, are provided by their respective owners
+under their own terms, and are not covered by this licence.
+
+NO WARRANTY
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT. IN NO EVENT SHALL THE COPYRIGHT
+HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY, WHETHER IN AN
+ACTION OF CONTRACT, TORT, OR OTHERWISE, ARISING FROM, OUT OF, OR IN CONNECTION
+WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+ENFORCEMENT
+
+Unauthorized use of the Software may violate copyright, trademark, trade secret,
+and other applicable laws, and may result in civil and criminal penalties.
