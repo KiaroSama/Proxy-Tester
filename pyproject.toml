@@ -1,6 +1,6 @@
 [project]
 name = "proxy-tester"
-version = "17.0.0"
+version = "17.1.0"
 description = "Fetch public proxies from curated sources and test them concurrently."
 requires-python = ">=3.9"
 license = { file = "LICENSE" }

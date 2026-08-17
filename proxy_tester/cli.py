@@ -9,6 +9,7 @@ import sys
 from collections.abc import Iterable
 
 from . import __version__
+from .colors import Color
 from .constants import (
     DEFAULT_IP_URL,
     DEFAULT_NEED,
@@ -35,7 +36,13 @@ from .probes import build_probe_targets
 from .runner import run_checks
 from .runtime import install_asyncio_exception_filter, python_version_ok
 from .sources import SOURCES
-from .terminal import Ansi, paint
+from .terminal import (
+    paint,
+    print_header,
+    print_pair,
+    scheme_color,
+    separator_line,
+)
 
 
 def prompt_for_need(default_need: int = DEFAULT_NEED) -> int:
@@ -69,26 +76,33 @@ def print_source_summary(results: Iterable[SourceResult], total_unique: int) -> 
     rows = list(results)
     ok_rows = [item for item in rows if not item.error and item.count > 0]
     failed_rows = [item for item in rows if item.error]
-    print(
-        f"{paint('Fetched sources', Ansi.BLUE)}: {len(ok_rows)}/{len(rows)} | "
-        f"{paint('unique candidates', Ansi.CYAN)}: {total_unique:,}",
-        file=sys.stderr,
-    )
+
+    print_header("SOURCES", Color.HEADER_SOURCES)
+    print_pair("Fetched", f"{len(ok_rows)}/{len(rows)}", Color.SOURCE_OK)
+    print_pair("Unique candidates", f"{total_unique:,}", Color.SOURCE_TOTAL)
+
     if ok_rows:
         top = ", ".join(
-            f"{item.source.name}={item.count}"
+            f"{paint(item.source.name, Color.SOURCE_NAME)}"
+            f"{paint('=', Color.LABEL)}"
+            f"{paint(str(item.count), Color.SOURCE_COUNT)}"
             for item in sorted(ok_rows, key=lambda row: row.count, reverse=True)[:6]
         )
-        print(f"top sources: {top}", file=sys.stderr)
+        print("  " + paint("Top:", Color.LABEL) + " " + top, file=sys.stderr)
     if failed_rows:
         preview = ", ".join(item.source.name for item in failed_rows[:10])
         more = f", +{len(failed_rows) - 10} more" if len(failed_rows) > 10 else ""
-        print(f"failed/skipped ({len(failed_rows)}): {preview}{more}", file=sys.stderr)
+        print_pair(f"Failed/skipped ({len(failed_rows)})", preview + more, Color.SOURCE_FAIL)
 
 
 def list_sources() -> None:
     for item in sorted(SOURCES, key=lambda source: (source.priority, source.name)):
-        print(f"{item.priority}\t{item.name}\t{item.scheme_hint}\t{item.urls[0]}")
+        print(
+            f"{paint(str(item.priority), Color.LABEL)}\t"
+            f"{paint(item.name, Color.SOURCE_NAME)}\t"
+            f"{paint(item.scheme_hint, scheme_color(item.scheme_hint))}\t"
+            f"{paint(item.urls[0], Color.DIM)}"
+        )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -249,40 +263,43 @@ async def async_main(args) -> int:
 
     candidates, source_results = await fetch_all_sources(args)
     if not candidates:
-        print(paint("ERROR: no candidates fetched from any source.", Ansi.RED), file=sys.stderr)
+        print(paint("ERROR: no candidates fetched from any source.", Color.ERROR), file=sys.stderr)
         return 1
 
     print_source_summary(source_results, len(candidates))
+
+    print_header("TESTING", Color.HEADER_TESTING)
     if args.vies_check:
-        probe_description = f"VIES VAT {paint(args.vies_probe_vat, Ansi.YELLOW)} must return valid=true"
+        probe = f"VIES VAT {args.vies_probe_vat} must return valid=true"
     else:
-        probe_description = f"reachability via {paint(str(len(args.probe_targets)), Ansi.YELLOW)} endpoint(s)"
-    print(f"Proxy health probe: {probe_description}.", file=sys.stderr)
+        probe = f"reachability via {len(args.probe_targets)} endpoint(s)"
+    print_pair("Health probe", probe, Color.PROBE_NAME)
+    print_pair("Workers", args.workers, Color.VALUE)
+    print_pair("Timeout", f"{args.timeout}s", Color.VALUE)
+    print(file=sys.stderr)
 
     tested, found, elapsed, baseline_ip = await run_checks(candidates, args)
-    abs_out = os.path.abspath(args.output)
 
-    print(f"Saved {paint(str(found), Ansi.GREEN)} working proxies to: {abs_out}", file=sys.stderr)
-    print(
-        f"tested={tested:,} | workers={args.workers} | timeout={args.timeout}s | "
-        f"stability_checks={args.stability_checks} | elapsed={elapsed:.2f}s",
-        file=sys.stderr,
-    )
+    print_header("RESULTS", Color.HEADER_RESULTS)
+    print_pair("Saved", f"{found} working proxies", Color.SUCCESS)
+    print_pair("Output", os.path.abspath(args.output), Color.OUTPUT_PATH)
+    print_pair("Tested", f"{tested:,}", Color.PROGRESS_TESTED)
+    print_pair("Elapsed", f"{elapsed:.2f}s", Color.PROGRESS_ELAPSED)
     if baseline_ip:
-        print(f"baseline_ip={baseline_ip}", file=sys.stderr)
+        print_pair("Baseline IP", baseline_ip, Color.VALUE)
 
     if found < args.need:
         if tested >= len(candidates):
             message = (
-                f"Warning: only {found} working proxies were found after checking "
-                f"all {len(candidates):,} candidates."
+                f"Only {found} working proxies were found after checking all {len(candidates):,} candidates."
             )
         else:
             message = (
-                f"Warning: stopped after {tested:,}/{len(candidates):,} candidates. "
+                f"Stopped after {tested:,}/{len(candidates):,} candidates. "
                 "Use --tail-empty-timeout 0 for a complete check."
             )
-        print(paint(message, Ansi.YELLOW), file=sys.stderr)
+        print_pair("Warning", message, Color.WARNING)
+    print(separator_line(Color.HEADER_RESULTS), file=sys.stderr)
     return 0
 
 

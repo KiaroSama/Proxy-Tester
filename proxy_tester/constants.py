@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from typing import Tuple
 
-USER_AGENT = "proxy-tester/17.0"
+USER_AGENT = "proxy-tester/17.1"
 
 # How many working proxies to collect when the user does not say.
 DEFAULT_NEED = 50

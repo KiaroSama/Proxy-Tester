@@ -12,6 +12,7 @@ from contextlib import suppress
 from pathlib import Path
 from typing import Deque, Optional, Tuple
 
+from .colors import Color
 from .constants import USER_AGENT
 from .models import ProxyCandidate
 from .parsing import extract_ip
@@ -28,7 +29,7 @@ from .runtime import (
     ensure_runtime_deps,
     maybe_raise_nofile_limit,
 )
-from .terminal import Ansi, paint, progress_loop, status_line
+from .terminal import paint, progress_loop, status_line
 
 
 class ResultWriter:
@@ -253,7 +254,7 @@ async def run_checks(candidates: Sequence[ProxyCandidate], args) -> Tuple[int, i
                     print(
                         paint(
                             "Warning: could not detect baseline IP, strict IP-change mode was disabled.",
-                            Ansi.YELLOW,
+                            Color.WARNING,
                         ),
                         file=sys.stderr,
                     )
