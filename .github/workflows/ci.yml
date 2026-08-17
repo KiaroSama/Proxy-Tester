@@ -1,0 +1,121 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (py${{ matrix.python-version }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        # Oldest and newest supported interpreters on Linux, plus a Windows and
+        # a macOS run: the tool ships a PowerShell launcher and takes a
+        # Windows-specific path in probe_reachability.
+        os: [ubuntu-latest]
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+        include:
+          - os: windows-latest
+            python-version: "3.13"
+          - os: macos-latest
+            python-version: "3.13"
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-dev.txt
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Check formatting
+        run: ruff format --check .
+
+      - name: Byte-compile every module
+        run: python -m compileall -q proxy_tester main.py
+
+      # --timeout is not used here: pytest-timeout is not a dependency. The job
+      # level timeout-minutes above is the bound, and the suite is offline and
+      # finishes in well under a second.
+      - name: Run tests
+        run: python -m pytest tests/ -q --maxfail=1
+
+      - name: Verify no test suite is skipped by CI
+        shell: bash
+        run: |
+          # Every tests/test_*.py must be collected. A file that exists but is
+          # never run is a silent coverage hole.
+          on_disk=$(find tests -name 'test_*.py' | wc -l)
+          collected=$(python -m pytest tests/ --collect-only -q 2>/dev/null \
+            | grep -oE '^tests[/\\][^:]+\.py' | sort -u | wc -l)
+          echo "suites on disk: $on_disk, collected: $collected"
+          if [ "$on_disk" -ne "$collected" ]; then
+            echo "::error::A test suite on disk is not being collected by CI."
+            exit 1
+          fi
+
+      - name: Smoke-test the CLI
+        run: |
+          python main.py --version
+          python main.py --help
+          python main.py --list-sources
+
+  encoding:
+    name: UTF-8 and hygiene
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Every tracked text file must be valid UTF-8
+        shell: bash
+        run: |
+          failed=0
+          while IFS= read -r f; do
+            # Skip binaries: if git treats it as binary, encoding does not apply.
+            if git diff --numstat 4b825dc642cb6eb9a060e54bf8d69288fbee4904 -- "$f" \
+               | grep -q '^-'; then
+              continue
+            fi
+            if ! iconv -f UTF-8 -t UTF-8 "$f" >/dev/null 2>&1; then
+              echo "::error file=$f::not valid UTF-8"
+              failed=1
+            fi
+          done < <(git ls-files)
+          exit $failed
+
+      - name: Output directory must never be committed
+        shell: bash
+        run: |
+          if git ls-files --error-unmatch output 2>/dev/null; then
+            echo "::error::output/ is generated and must stay untracked."
+            exit 1
+          fi
+          if git ls-files | grep -qi 'working_proxies.txt'; then
+            echo "::error::working_proxies.txt must not be tracked."
+            exit 1
+          fi
+          echo "OK: generated output is untracked."

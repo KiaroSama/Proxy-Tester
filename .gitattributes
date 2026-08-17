@@ -1,0 +1,22 @@
+# Normalize line endings in the repository; check out platform-native.
+* text=auto eol=lf
+
+# Windows-only scripts keep CRLF so they run when checked out on Windows.
+*.ps1   text eol=crlf
+*.cmd   text eol=crlf
+*.bat   text eol=crlf
+
+# Explicit text types.
+*.py    text diff=python
+*.md    text
+*.txt   text
+*.toml  text
+*.yml   text
+*.yaml  text
+
+# Never touched by EOL normalization.
+*.png   binary
+*.jpg   binary
+*.ico   binary
+*.exe   binary
+*.zip   binary

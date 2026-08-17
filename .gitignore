@@ -1,0 +1,66 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# Local environments and caches
+.venv/
+venv/
+.cache/
+Logs/
+logs/
+
+# Program output: generated proxy lists, never source
+/output/
+/working_proxies.txt
+working_proxies.txt
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Private, local-only files (never commit, publish, or share)
+/secrets.md
+/explain-AI.md
+/reference.md
+/CLAUDE.md
+/AGENTS.md
+
+# .ignoreme protected files/directories at any depth
+.ignoreme
+.ignoreme/
+**/.ignoreme
+**/.ignoreme/
+
+# Local agent settings and author notes (local-only)
+/.agents/
+/.claude/
+/.kiro/
+/.codex/
+/.cursor/
+/.cline/
+**/.claude/
+**/.kiro/
+**/.codex/
+
+# Skill installer lockfile (local tooling state, not project source)
+/skills-lock.json
+
+# Graphify (local-only knowledge graph tooling and outputs)
+graphify-out/
+
+# Portable AI working memory (local-only; never commit)
+/.ai/
+
+# Secrets
+.env
+.env.*
+!.env.example
