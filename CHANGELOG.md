@@ -3,6 +3,39 @@
 All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [17.1.0] - 2026-08-17
+
+### Changed
+
+- Terminal output now follows the same theme as FFmWiz: a leaf
+  `proxy_tester/colors.py` holding a `Color` palette of 256-colour and
+  truecolour codes with semantic names, and `terminal.py` gaining
+  `separator_line`, `print_header` and `print_pair`. Runs are now divided into
+  centred `SOURCES` / `TESTING` / `RESULTS` sections with gray labels and
+  coloured values, instead of one flat stream of lines.
+- Colour is still suppressed when stderr is redirected, so piped output and log
+  files stay free of escape codes.
+
+### Added
+
+- 28 tests for the palette and layout helpers, including guards that every
+  defined colour is actually referenced, that no two names share one code, and
+  that every opened escape sequence is closed. 283 tests total.
+
+### Dependencies
+
+Merged five Dependabot updates after verifying each one:
+
+- `actions/checkout` 5 → 7 and `actions/setup-python` 6 → 7 (both confirmed to
+  be the current official releases).
+- `aiohttp` floor → 3.14.3 and `pytest` floor → 9.1.1, matching the versions
+  the live end-to-end run was verified against.
+- `ruff` floor → 0.16.3, verified clean against the project at that exact
+  version before merging.
+
+The GitHub Actions bumps could not be exercised, because Actions is blocked on
+account billing for this repository — see the note in the README.
+
 ## [17.0.0] - 2026-08-17
 
 The single-file script became a package, and the health probe changed.

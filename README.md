@@ -109,6 +109,7 @@ Some sources publish `scheme://IP:PORT` and some zero-pad their octets
 main.py                  entry point
 proxy_tester/
   cli.py                 argument parsing and program flow
+  colors.py              ANSI palette (leaf module, depends on nothing)
   constants.py           tunable defaults and probe endpoints
   models.py              SourceSpec, ProxyCandidate, ProbeTarget, SourceResult
   sources.py             the curated source catalog
@@ -117,8 +118,8 @@ proxy_tester/
   probes.py              HTTP/SOCKS probes and the VIES check
   runner.py              worker pool, result writer, run orchestration
   runtime.py             dependency loading, fd limits, event-loop filtering
-  terminal.py            colour output and the live progress line
-tests/                   255 tests, no network required
+  terminal.py            headers, colour output, live progress line
+tests/                   283 tests, no network required
 ```
 
 ## Development
