@@ -79,7 +79,6 @@ def build_probe_targets(urls: Sequence[str]) -> List[ProbeTarget]:
             path_qs += "?" + split.query
         targets.append(
             ProbeTarget(
-                raw_url=raw_url,
                 scheme=scheme,
                 host=host,
                 port=port,
@@ -120,10 +119,8 @@ async def close_writer(writer) -> None:
         return
     with suppress(Exception):
         writer.close()
-    wait_closed = getattr(writer, "wait_closed", None)
-    if wait_closed is not None:
-        with suppress(Exception, asyncio.TimeoutError):
-            await asyncio.wait_for(wait_closed(), timeout=WRITER_CLOSE_TIMEOUT)
+    with suppress(Exception, asyncio.TimeoutError):
+        await asyncio.wait_for(writer.wait_closed(), timeout=WRITER_CLOSE_TIMEOUT)
 
 
 async def read_http_response(reader, deadline: float, body_limit: int = 0) -> Tuple[Optional[int], str]:

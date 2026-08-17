@@ -60,8 +60,7 @@ DEFAULT_PROBE_URLS: Tuple[str, ...] = (
 
 # Optional deep check: validate a known-good VAT ID through the EU VIES API.
 # Far slower and aggressively rate limited, so it is opt-in via --vies-check.
-VIES_API_BASE_URL = "https://ec.europa.eu/taxation_customs/vies/rest-api"
-VIES_CHECK_VAT_URL = VIES_API_BASE_URL + "/check-vat-number"
+VIES_CHECK_VAT_URL = "https://ec.europa.eu/taxation_customs/vies/rest-api/check-vat-number"
 DEFAULT_VIES_PROBE_VAT_ID = "BE0545786138"
 VIES_API_ACCEPT = "application/json, text/plain;q=0.9, */*;q=0.8"
 VIES_RESPONSE_BODY_LIMIT = 65536
@@ -73,17 +72,15 @@ IPV4_LIKE_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
 HOSTNAME_RE = re.compile(r"^(?=.{1,253}$)(?!-)(?:[A-Za-z0-9-]{1,63}\.)*[A-Za-z0-9-]{1,63}$")
 
 # Phrases that mean the upstream service rejected us rather than the proxy.
+# Matching is substring-based, so a short entry subsumes every longer phrase
+# containing it: "blocked" alone covers "ip blocked", "temporarily blocked" and
+# "your ip address is currently blocked".
 IP_BLOCK_KEYWORDS = (
-    "your ip address is currently blocked",
-    "your request for vat validation has not been processed",
-    "ip address is currently blocked",
-    "please contact taxud-viesweb@ec.europa.eu",
+    "blocked",
     "taxud-viesweb@ec.europa.eu",
-    "ip blocked",
-    "temporarily blocked",
+    "your request for vat validation has not been processed",
     "rate limit",
     "rate-limited",
     "too many requests",
     "access denied",
-    "blocked",
 )

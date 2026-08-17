@@ -116,7 +116,7 @@ async def fetch_one_source(
                     last_error = f"parsed {len(items)} items"
                     continue
                 return (
-                    SourceResult(source=source, count=len(items), url_used=url, error=None),
+                    SourceResult(source=source, count=len(items), error=None),
                     items,
                 )
         except asyncio.CancelledError:
@@ -124,7 +124,7 @@ async def fetch_one_source(
         except Exception as exc:
             last_error = str(exc)
     return (
-        SourceResult(source=source, count=0, url_used=None, error=last_error or "download failed"),
+        SourceResult(source=source, count=0, error=last_error or "download failed"),
         [],
     )
 

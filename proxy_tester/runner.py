@@ -78,18 +78,14 @@ class SharedState:
         self.started_at = time.time()
 
 
-async def read_small_text(response, limit: int = 2048) -> str:
-    data = await response.content.read(limit)
-    return data.decode("utf-8", errors="ignore")
-
-
 async def fetch_direct_ip(http_session, ip_url: str) -> Optional[str]:
     """Our own public IP, needed to prove a proxy actually changes it."""
     try:
         async with http_session.get(ip_url, allow_redirects=True) as response:
             if response.status >= 400:
                 return None
-            return extract_ip(await read_small_text(response, limit=4096))
+            body = await response.content.read(4096)
+            return extract_ip(body.decode("utf-8", errors="ignore"))
     except Exception:
         return None
 
