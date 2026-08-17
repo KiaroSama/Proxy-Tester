@@ -1,0 +1,44 @@
+[project]
+name = "proxy-tester"
+version = "17.0.0"
+description = "Fetch public proxies from curated sources and test them concurrently."
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+dependencies = [
+    "aiohttp>=3.13.3,<4",
+    "python-socks>=3.0.0,<4",
+]
+
+[project.scripts]
+proxy-tester = "proxy_tester.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 110
+target-version = "py39"
+exclude = [".venv", "output", "__pycache__", "old codes"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4"]
+ignore = [
+    # The probe helpers legitimately swallow every connection error: a dead
+    # proxy is the expected case, not an exception worth surfacing.
+    "B904",
+    # PEP 585/604 rewrites (List -> list, Optional[X] -> X | None). Most of our
+    # annotations are safe under `from __future__ import annotations`, but
+    # models.CandidateKey is a *runtime* alias: `str | None` inside it needs
+    # 3.10 and would break the 3.9 floor. Keeping typing generics everywhere is
+    # consistent and costs nothing.
+    "UP006",
+    "UP045",
+    # Same reason: the typing.* aliases these flag are what UP006/UP045 would
+    # rewrite, so banning the import while keeping the usage is contradictory.
+    "UP035",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Source catalog: long URLs are more readable unwrapped.
+"proxy_tester/sources.py" = ["E501"]

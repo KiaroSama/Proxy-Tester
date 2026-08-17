@@ -1,0 +1,28 @@
+version: 2
+
+updates:
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: daily
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore"
+    groups:
+      # One PR for routine dev-tool bumps; runtime deps stay separate so a
+      # change to aiohttp or python-socks gets reviewed on its own.
+      dev-dependencies:
+        patterns:
+          - "pytest*"
+          - "ruff"
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore"
