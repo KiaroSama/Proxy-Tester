@@ -18,7 +18,6 @@ class Ansi:
     """The handful of SGR codes used by the status output."""
 
     RESET = "\033[0m"
-    BOLD = "\033[1m"
     DIM = "\033[2m"
     RED = "\033[31m"
     GREEN = "\033[32m"

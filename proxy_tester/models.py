@@ -59,7 +59,6 @@ class ProxyCandidate:
 class ProbeTarget:
     """A probe URL parsed once, so workers never re-parse it per proxy."""
 
-    raw_url: str
     scheme: str
     host: str
     port: int
@@ -73,5 +72,4 @@ class SourceResult:
 
     source: SourceSpec
     count: int
-    url_used: Optional[str] = None
     error: Optional[str] = None
