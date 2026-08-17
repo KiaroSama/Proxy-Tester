@@ -5,7 +5,7 @@ description = "Fetch public proxies from curated sources and test them concurren
 requires-python = ">=3.9"
 license = { file = "LICENSE" }
 dependencies = [
-    "aiohttp>=3.13.3,<4",
+    "aiohttp>=3.14.3,<4",
     "python-socks>=3.0.0,<4",
 ]
 
