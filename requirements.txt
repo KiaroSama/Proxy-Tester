@@ -2,4 +2,4 @@
 # Verified together on 2026-08-17 against Python 3.11 (Windows) with a live
 # end-to-end run covering the HTTP, SOCKS4 and SOCKS5 code paths.
 aiohttp>=3.14.3,<4
-python-socks>=3.0.0,<4
+python-socks>=3.1.1,<4
