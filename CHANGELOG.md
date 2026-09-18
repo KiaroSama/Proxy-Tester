@@ -5,6 +5,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Licence
+
+- **Relicensed from proprietary to GPL-3.0-or-later** at the copyright holder's
+  request. `LICENSE` now holds the verbatim GNU GPL v3 text, `pyproject.toml`
+  declares the SPDX expression `GPL-3.0-or-later`, and the standard notice was
+  added to the two entry points. The old licence granted no rights at all; this
+  one makes the project free software.
+- Third-party proxy lists and the proxy servers they reference remain outside
+  the licence - they are not this project's to license.
+
 ### Dependencies
 
 Merged two Dependabot updates after verifying each on Python 3.13.15:
