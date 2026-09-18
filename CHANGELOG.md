@@ -3,6 +3,20 @@
 All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Dependencies
+
+Merged two Dependabot updates after verifying each on Python 3.13.15:
+
+- `python-socks` floor -> 3.1.1. The SOCKS path is load-bearing, so it was
+  proven at runtime, not just by signature: 42 live SOCKS4/SOCKS5 proxies
+  confirmed working through `probe_reachability`.
+- `ruff` floor -> 0.16.7. Checked with 0.16.8 (the installed version that
+  satisfies it): `ruff check` and `ruff format --check` both clean.
+
+The 283-test suite passes on Python 3.13.15 with these versions.
+
 ## [17.1.0] - 2026-08-17
 
 ### Changed
