@@ -22,7 +22,7 @@ if ($py) {
 } elseif ($python) {
     & $python.Source $scriptPath @args
 } else {
-    Write-Host "Python was not found. Install Python 3.9+ or add it to PATH." -ForegroundColor Red
+    Write-Host "Python was not found. Install Python 3.10+ or add it to PATH." -ForegroundColor Red
     Read-Host "Press Enter to close"
     exit 1
 }

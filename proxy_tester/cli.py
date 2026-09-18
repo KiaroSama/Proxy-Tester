@@ -323,7 +323,7 @@ def _normalize_args(args) -> None:
 
 def main(argv=None) -> int:
     if not python_version_ok():
-        print("ERROR: Please run with Python 3.9+.", file=sys.stderr)
+        print("ERROR: Please run with Python 3.10+.", file=sys.stderr)
         return 2
 
     args = build_parser().parse_args(argv)

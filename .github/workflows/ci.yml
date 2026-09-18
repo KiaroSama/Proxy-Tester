@@ -26,7 +26,7 @@ jobs:
         # a macOS run: the tool ships a PowerShell launcher and takes a
         # Windows-specific path in probe_reachability.
         os: [ubuntu-latest]
-        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
         include:
           - os: windows-latest
             python-version: "3.13"

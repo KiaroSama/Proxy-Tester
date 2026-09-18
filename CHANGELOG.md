@@ -17,6 +17,16 @@ Merged two Dependabot updates after verifying each on Python 3.13.15:
 
 The 283-test suite passes on Python 3.13.15 with these versions.
 
+### Changed
+
+- **Minimum Python is now 3.10** (was 3.9). `aiohttp` 3.14+ declares
+  `Requires-Python >=3.10`, so `aiohttp>=3.14.3` simply cannot be installed on
+  3.9 - the dependency bump above had silently made the 3.9 claim false. CI
+  caught it the first time it was able to run: 7 of 8 jobs passed and only
+  `py3.9` failed, at the install step. Python 3.9 reached end of life in
+  October 2025, so the floor moved up rather than pinning aiohttp back.
+  The CI matrix now covers 3.10-3.13.
+
 ## [17.1.0] - 2026-08-17
 
 ### Changed
