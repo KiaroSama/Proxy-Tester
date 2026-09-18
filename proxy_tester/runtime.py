@@ -9,8 +9,9 @@ import subprocess
 import sys
 from typing import Optional
 
-# 3.9 is the floor CI actually exercises; claiming 3.8 would be untested.
-MIN_PYTHON = (3, 9)
+# 3.10 is the real floor: aiohttp 3.14+ requires >=3.10, so 3.9 cannot even
+# install this project's dependencies. CI proved it (py3.9 job failed).
+MIN_PYTHON = (3, 10)
 
 
 def python_version_ok() -> bool:

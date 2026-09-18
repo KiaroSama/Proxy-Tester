@@ -14,7 +14,8 @@ tested=159 | workers=1000 | timeout=6.0s | elapsed=1.69s
 
 ## Requirements
 
-- Python 3.9 or newer (developed on 3.11; CI covers 3.9-3.13)
+- Python 3.10 or newer (CI covers 3.10-3.13). `aiohttp` 3.14+ requires 3.10,
+  and Python 3.9 reached end of life in October 2025.
 - `aiohttp` and `python-socks` — installed automatically on first run, or
   manually with `pip install -r requirements.txt`
 

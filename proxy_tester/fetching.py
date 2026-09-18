@@ -202,7 +202,7 @@ async def _health_check_sources(
 
     healthy: List[SourceSpec] = []
     preferred_urls: Dict[str, str] = {}
-    for source, row in zip(sources, rows):
+    for source, row in zip(sources, rows, strict=True):
         if isinstance(row, BaseException):
             results.append(SourceResult(source=source, count=0, error=f"health: {row}"))
             continue
@@ -260,7 +260,7 @@ async def fetch_all_sources(args) -> Tuple[List[ProxyCandidate], List[SourceResu
                 *(bounded_fetch(source) for source in batch), return_exceptions=True
             )
 
-            for source, item in zip(batch, gathered):
+            for source, item in zip(batch, gathered, strict=True):
                 if isinstance(item, BaseException):
                     results.append(SourceResult(source=source, count=0, error=str(item)))
                     continue
