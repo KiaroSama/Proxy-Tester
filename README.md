@@ -134,10 +134,22 @@ ruff check .
 The test suite is offline and runs in well under a second. Live behaviour is
 verified by running the tool itself.
 
-## Legal
+## License
 
-Proprietary — see [LICENSE](LICENSE). Third-party proxy lists and the proxy
-servers they reference are not owned or controlled by this project. You are
+Copyright (C) 2026 KiaroSama.
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE. See the [GNU General Public License](LICENSE) for more
+details.
+
+Third-party proxy lists and the proxy servers they reference are not owned or
+controlled by this project and are not covered by this licence. You are
 responsible for complying with the terms of any proxy or service you use.
 
 ## Donate

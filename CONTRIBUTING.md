@@ -1,7 +1,8 @@
 # Contributing
 
-This is a proprietary project (see [LICENSE](LICENSE)). Contributions are
-accepted only from people who have been granted access.
+This project is free software under the GNU General Public License v3.0 or
+later (see [LICENSE](LICENSE)). Contributions are welcome, and by submitting one
+you agree it may be distributed under that licence.
 
 ## Setup
 
