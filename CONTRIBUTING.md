@@ -22,7 +22,7 @@ ruff check .
 python main.py --need 5      # a real run still has to work
 ```
 
-All three must pass. CI runs the same checks on Python 3.9 through 3.13.
+All three must pass. CI runs the same checks on Python 3.10 through 3.13.
 
 ## Ground rules
 
