@@ -1,5 +1,24 @@
 # Proxy Tester
 
+[![CI](https://img.shields.io/github/actions/workflow/status/KiaroSama/Proxy-Tester/ci.yml?branch=main&label=CI)](https://github.com/KiaroSama/Proxy-Tester/actions/workflows/ci.yml)
+[![License](https://img.shields.io/github/license/KiaroSama/Proxy-Tester)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/KiaroSama/Proxy-Tester)](https://github.com/KiaroSama/Proxy-Tester/releases/latest)
+[![Tests](https://img.shields.io/badge/tests-283%20offline-blue)](https://github.com/KiaroSama/Proxy-Tester/actions/workflows/ci.yml)
+
+[![Python](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13-3776AB)](pyproject.toml)
+[![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey)](.github/workflows/ci.yml)
+[![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
+
+[![Last commit](https://img.shields.io/github/last-commit/KiaroSama/Proxy-Tester)](https://github.com/KiaroSama/Proxy-Tester/commits/main)
+[![Commit activity](https://img.shields.io/github/commit-activity/m/KiaroSama/Proxy-Tester)](https://github.com/KiaroSama/Proxy-Tester/graphs/commit-activity)
+[![Stars](https://img.shields.io/github/stars/KiaroSama/Proxy-Tester)](https://github.com/KiaroSama/Proxy-Tester/stargazers)
+
+[![Built with aiohttp](https://img.shields.io/badge/built%20with-aiohttp-2C5BB4)](https://github.com/aio-libs/aiohttp)
+[![Built with python-socks](https://img.shields.io/badge/built%20with-python--socks-2C5BB4)](https://github.com/romis2012/python-socks)
+[![Top language](https://img.shields.io/github/languages/top/KiaroSama/Proxy-Tester)](https://github.com/KiaroSama/Proxy-Tester)
+[![Code size](https://img.shields.io/github/languages/code-size/KiaroSama/Proxy-Tester)](https://github.com/KiaroSama/Proxy-Tester)
+[![Support donations](https://img.shields.io/badge/Support-donations-d04a9a)](#donate)
+
 Fetch public proxies from 95 curated sources, test them concurrently, and write
 the working ones to a single file — typically **15 working proxies in under two
 seconds**.
