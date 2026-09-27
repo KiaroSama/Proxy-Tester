@@ -24,11 +24,27 @@ the working ones to a single file — typically **15 working proxies in under tw
 seconds**.
 
 ```
-Fetched sources: 10/10 | unique candidates: 3,604
-Proxy health probe: reachability via 3 endpoint(s).
-Tested 159/3604 | working=15 | need=15 | rate=128.8/s | active=0
-Saved 15 working proxies to: .../output/working_proxies.txt
-tested=159 | workers=1000 | timeout=6.0s | elapsed=1.69s
+                                    SOURCES
+================================================================================
+  Fetched: 10/10
+  Unique candidates: 5,330
+  Top: proxifly_http=1200, proxifly_socks5=1200, proxifly_https=950, ...
+
+                                    TESTING
+================================================================================
+  Health probe: reachability via 3 endpoint(s)
+  Workers: 1000
+  Timeout: 6.0s
+
+tested 118/5330 | working 15 | need 15 | 320.2/s | active 0
+
+                                    RESULTS
+================================================================================
+  Saved: 15 working proxies
+  Output: .../output/working_proxies.txt
+  Tested: 118
+  Elapsed: 0.82s
+================================================================================
 ```
 
 ## Requirements
