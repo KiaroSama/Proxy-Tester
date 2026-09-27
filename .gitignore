@@ -73,3 +73,8 @@ graphify-out/
 !/.env.sample
 !/.env.template
 !/.env.dist
+
+/.specify/
+/specs/
+/.codebase-memory/
+/plans/
